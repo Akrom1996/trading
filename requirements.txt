@@ -1,0 +1,9 @@
+xgboost
+scikit-learn
+pandas
+numpy
+websocket-client
+python-telegram-bot
+ccxt
+requests
+ta

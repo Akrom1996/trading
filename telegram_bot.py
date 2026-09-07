@@ -1,9 +1,10 @@
 import requests
+import os
 
-TELEGRAM_TOKEN   = '8856618747:AAEdgr3n_y_7SBDoBGAYii9HqXqQ8rS2CEA'    # from BotFather
-TELEGRAM_CHAT_ID = '-1004436772852'      # from userinfobot
+TELEGRAM_TOKEN   = os.getenv('TELEGRAM_TOKEN', '')   # from BotFather
+TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')      # from userinfobot
 
-def notify_signal_with_liq(signal, daily_trades, liq, level_text=''):
+def notify_signal_with_liq(signal, daily_trades, liq, level_text='',symbol=''):
     emoji = '🟢' if signal['action'] == 'BUY' else '🔴'
     liq_emoji = '🐻' if liq and liq['bias'] == 'BEARISH' else '🐂' if liq and liq['bias'] == 'BULLISH' else '⚖️'
 
@@ -18,7 +19,7 @@ def notify_signal_with_liq(signal, daily_trades, liq, level_text=''):
         )
 
     msg = (
-        f"{emoji} <b>{signal['action']} Signal — {signal.get('symbol', '')}</b>\n\n"
+        f"{emoji} <b>{signal['action']} Signal — {symbol}</b>\n\n"
         f"💰 Entry:       <b>{signal['entry']}</b>\n"
         f"🎯 Take Profit: <b>{signal['take_profit']}</b>\n"
         f"🛑 Stop Loss:   <b>{signal['stop_loss']}</b>\n"
@@ -81,8 +82,8 @@ def notify_error(error: str):
     send_message(f"❌ <b>Bot Error</b>\n<code>{error}</code>")
 
 
-def notify_start():
-    send_message("✅ <b>ZEC/USDT Trading Bot Started</b>")
+def notify_start(symbol: str):
+    send_message(f"✅ <b>{symbol} Trading Bot Started</b>")
 
 
 def notify_stop():

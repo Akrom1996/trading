@@ -224,15 +224,3 @@ def get_liq_data(symbol='ZEC', current_price=None):
     liq = analyze_liquidations(tracker)
     levels = get_liq_levels(tracker, current_price)
     return liq, levels
-
-
-if __name__ == "__main__":
-    # quick manual smoke test
-    print("Connecting to ZECUSDT forceOrder stream... (Ctrl+C to stop)")
-    t = _get_tracker("ZEC")
-    time.sleep(3)
-    print("connected:", t.connected)
-    while True:
-        time.sleep(30)
-        liq, levels = get_liq_data("ZEC", current_price=None)
-        print(datetime.now().strftime("%H:%M:%S"), "->", liq)

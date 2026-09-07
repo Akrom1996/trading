@@ -2,12 +2,27 @@
 Triple-barrier probability model -- simplified for spot-only trading.
 
 Since spot trading is long-only (no shorting), there's only one question
-that matters: from the current candle, does price reach +1.5% before -1%
-within the horizon, or not?
+that matters: from the current candle, does price reach +TP_PCT before
+-SL_PCT within the horizon, or not?
 
-    TP_FIRST  : price hits +1.5% before -1% and before timeout -> BUY
-    SL_FIRST  : price hits -1% before +1.5% -> don't enter
+    TP_FIRST  : price hits +TP_PCT before -SL_PCT and before timeout -> BUY
+    SL_FIRST  : price hits -SL_PCT before +TP_PCT -> don't enter
     TIMEOUT   : horizon passes with neither touched -> don't enter
+
+CHANGE LOG (Sept 2026):
+  - Horizon shortened from 2 days (576 candles) to 12 hours (144 candles).
+    A 2-day horizon with a 1% SL / 1.5% TP gave the -1% barrier enormous
+    time to get randomly tapped by ordinary chop before a clean +1.5%
+    could register -- live logs showed SL_FIRST=100% almost permanently.
+  - SL widened relative to TP (was SL=1%/TP=1.5%, now SL=1.5%/TP=1.5%)
+    so normal in-trend pullbacks don't auto-disqualify a good setup.
+  - Added sample_weight='balanced' so XGBoost can't just default to
+    always predicting the majority class when TP_FIRST is rare.
+  - Model/label-distribution logging now returns machine-readable data
+    so callers (e.g. Telegram notifier) can surface imbalance warnings
+    instead of it only being visible in console output.
+  - Paths are now symbol-aware so multiple coins running in parallel
+    (SOL/ZEC/BTC) don't overwrite each other's saved models.
 
 Uses the same FEATURES your existing model already computes -- no new
 indicators needed.
@@ -19,27 +34,38 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.utils.class_weight import compute_sample_weight
 from xgboost import XGBClassifier
 
 from trading_model import FEATURES  # reuse your existing feature set
 
 # ── Barrier configuration ──────────────────────────────────
-CANDLES_PER_DAY  = 288                 # 24h * 60min / 5min candles
-HORIZON_CANDLES  = CANDLES_PER_DAY * 2 # 2-day forward window
+CANDLES_PER_DAY  = 288                  # 24h * 60min / 5min candles
+HORIZON_CANDLES  = CANDLES_PER_DAY // 2 # 12-hour forward window (was 2 days)
 TP_PCT           = 0.015                # +1.5% target
-SL_PCT           = 0.01                 # -1% stop
+SL_PCT           = 0.015                # -1.5% stop (was 1% -- too tight)
 
 LABEL_SL_FIRST = 0
 LABEL_TP_FIRST = 1
 LABEL_TIMEOUT  = 2
 
 LABEL_NAMES = {
-    LABEL_SL_FIRST: "SL_FIRST (-1%)",
-    LABEL_TP_FIRST: "TP_FIRST (+1.5%)",
+    LABEL_SL_FIRST: f"SL_FIRST (-{SL_PCT*100:.1f}%)",
+    LABEL_TP_FIRST: f"TP_FIRST (+{TP_PCT*100:.1f}%)",
     LABEL_TIMEOUT:  "TIMEOUT",
 }
 
-MODEL_PATH = "barrier_model.pkl"
+# Warn if a class falls below this share of training examples -- XGBoost
+# can still learn from an imbalanced set, but under ~5% it tends to just
+# collapse toward always predicting the majority class.
+MIN_HEALTHY_CLASS_SHARE = 0.05
+
+
+def _model_path(symbol: str) -> str:
+    """e.g. 'ZEC/USDT' -> 'barrier_model_ZECUSDT.pkl' -- keeps parallel
+    per-coin containers/processes from clobbering each other's models."""
+    safe = symbol.replace('/', '').upper()
+    return f"barrier_model_{safe}.pkl"
 
 
 def label_triple_barrier(df: pd.DataFrame, horizon=HORIZON_CANDLES,
@@ -76,22 +102,26 @@ def label_triple_barrier(df: pd.DataFrame, horizon=HORIZON_CANDLES,
     return out
 
 
-def train_barrier_model(df: pd.DataFrame):
+def train_barrier_model(df: pd.DataFrame, symbol: str = None):
     """
     df must already have features added (same add_features() pipeline
     you use for the main model) plus 'high', 'low', 'close' columns.
 
-    Returns (model, scaler, encoder). LabelEncoder compresses whatever
-    labels ARE present into a contiguous range so XGBoost doesn't choke
-    if one outcome never occurred in the training window.
+    Returns (model, scaler, encoder, label_stats). label_stats is a dict
+    you can log or push to Telegram so imbalance is visible without
+    reading console output by hand.
     """
     labeled = label_triple_barrier(df)
 
-    print(f"  Label distribution:")
+    total = len(labeled)
+    label_stats = {}
+    print(f"  Label distribution{f' ({symbol})' if symbol else ''}:")
     for lbl, name in LABEL_NAMES.items():
-        count = (labeled['barrier_label'] == lbl).sum()
-        pct = count / len(labeled) * 100
-        print(f"    {name:20s}: {count:5d} ({pct:.1f}%)")
+        count = int((labeled['barrier_label'] == lbl).sum())
+        pct = count / total * 100 if total else 0.0
+        label_stats[name] = {'count': count, 'pct': round(pct, 1)}
+        flag = " ⚠️ low" if pct / 100 < MIN_HEALTHY_CLASS_SHARE else ""
+        print(f"    {name:20s}: {count:5d} ({pct:.1f}%){flag}")
 
     X = labeled[FEATURES]
     y = labeled['barrier_label']
@@ -109,6 +139,11 @@ def train_barrier_model(df: pd.DataFrame):
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
 
+    # Balanced sample weighting -- without this, XGBoost minimizes
+    # log-loss by leaning toward whichever class is most common, which
+    # is exactly the "always predicts SL_FIRST" failure mode we saw live.
+    sample_weight = compute_sample_weight(class_weight='balanced', y=y_encoded)
+
     model = XGBClassifier(
         n_estimators=300,
         max_depth=5,
@@ -117,22 +152,27 @@ def train_barrier_model(df: pd.DataFrame):
         num_class=num_classes,
         eval_metric='mlogloss',
     )
-    model.fit(X_scaled, y_encoded)
-    return model, scaler, encoder
+    model.fit(X_scaled, y_encoded, sample_weight=sample_weight)
+    return model, scaler, encoder, label_stats
 
 
-def save_barrier_model(model, scaler, encoder, path=MODEL_PATH, candles_count=None):
+def save_barrier_model(model, scaler, encoder, symbol: str, path: str = None,
+                        candles_count=None, label_stats=None):
+    path = path or _model_path(symbol)
     with open(path, 'wb') as f:
         pickle.dump({
             'model': model,
             'scaler': scaler,
             'encoder': encoder,
+            'symbol': symbol,
             'trained_at': datetime.now(),
             'candles_count': candles_count,
+            'label_stats': label_stats,
         }, f)
 
 
-def load_barrier_model(path=MODEL_PATH):
+def load_barrier_model(symbol: str, path: str = None):
+    path = path or _model_path(symbol)
     try:
         with open(path, 'rb') as f:
             data = pickle.load(f)
@@ -167,10 +207,10 @@ def predict_barrier_probabilities(model, scaler, encoder, df_latest: pd.DataFram
 
 def should_enter(barrier_probs: dict, min_profit_prob=0.40):
     """
-    Spot/long-only decision rule: enter (BUY) only if P(+1.5% before -1%)
-    clears the threshold. Returns (should_buy: bool, reason: str).
+    Spot/long-only decision rule: enter (BUY) only if P(+TP_PCT before
+    -SL_PCT) clears the threshold. Returns (should_buy: bool, reason: str).
     """
     p = barrier_probs['p_tp_first']
     if p >= min_profit_prob:
-        return True, f"P(+1.5% before -1%)={p:.0%} — entering"
-    return False, f"P(+1.5% before -1%)={p:.0%} below {min_profit_prob:.0%} threshold — skipping"
+        return True, f"P(+{TP_PCT*100:.1f}% before -{SL_PCT*100:.1f}%)={p:.0%} — entering"
+    return False, f"P(+{TP_PCT*100:.1f}% before -{SL_PCT*100:.1f}%)={p:.0%} below {min_profit_prob:.0%} threshold — skipping"

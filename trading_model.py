@@ -13,10 +13,18 @@ FEATURES = [
     'candle_body', 'price_pos', 'volume'
 ]
 
-MODEL_PATH    = 'saved_model.pkl'
-SCALER_PATH   = 'saved_scaler.pkl'
-METADATA_PATH = 'model_metadata.pkl'
-ENCODER_PATH  = 'saved_encoder.pkl'
+
+def _paths(symbol: str):
+    """Symbol-specific file paths so SOL/ZEC/BTC running in parallel
+    (separate containers or one process) don't overwrite each other's
+    saved model/scaler/encoder/metadata."""
+    safe = symbol.replace('/', '').upper()
+    return {
+        'model':    f'saved_model_{safe}.pkl',
+        'scaler':   f'saved_scaler_{safe}.pkl',
+        'encoder':  f'saved_encoder_{safe}.pkl',
+        'metadata': f'model_metadata_{safe}.pkl',
+    }
 
 
 def train_model(df):
@@ -48,35 +56,38 @@ def train_model(df):
     return model, scaler, encoder
 
 
-def save_model(model, scaler, encoder, candles_count):
-    with open(MODEL_PATH, 'wb') as f:
+def save_model(model, scaler, encoder, symbol: str, candles_count=None):
+    paths = _paths(symbol)
+    with open(paths['model'], 'wb') as f:
         pickle.dump(model, f)
-    with open(SCALER_PATH, 'wb') as f:
+    with open(paths['scaler'], 'wb') as f:
         pickle.dump(scaler, f)
-    with open(ENCODER_PATH, 'wb') as f:
+    with open(paths['encoder'], 'wb') as f:
         pickle.dump(encoder, f)
-    with open(METADATA_PATH, 'wb') as f:
+    with open(paths['metadata'], 'wb') as f:
         pickle.dump({
             'trained_at':    datetime.now(),
             'candles_count': candles_count,
+            'symbol':        symbol,
         }, f)
-    print(f"  Model saved to {MODEL_PATH}")
+    print(f"  Model saved to {paths['model']}")
 
 
-def load_model():
-    if not os.path.exists(MODEL_PATH) or \
-       not os.path.exists(SCALER_PATH) or \
-       not os.path.exists(METADATA_PATH) or \
-       not os.path.exists(ENCODER_PATH):
+def load_model(symbol: str):
+    paths = _paths(symbol)
+    if not os.path.exists(paths['model']) or \
+       not os.path.exists(paths['scaler']) or \
+       not os.path.exists(paths['metadata']) or \
+       not os.path.exists(paths['encoder']):
         return None, None, None, None
 
-    with open(MODEL_PATH, 'rb') as f:
+    with open(paths['model'], 'rb') as f:
         model = pickle.load(f)
-    with open(SCALER_PATH, 'rb') as f:
+    with open(paths['scaler'], 'rb') as f:
         scaler = pickle.load(f)
-    with open(ENCODER_PATH, 'rb') as f:
+    with open(paths['encoder'], 'rb') as f:
         encoder = pickle.load(f)
-    with open(METADATA_PATH, 'rb') as f:
+    with open(paths['metadata'], 'rb') as f:
         metadata = pickle.load(f)
 
     return model, scaler, encoder, metadata

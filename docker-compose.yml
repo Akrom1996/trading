@@ -1,0 +1,41 @@
+version: '3.8'
+
+services:
+  bot-sol:
+    build: .
+    container_name: bot-sol
+    environment:
+      - SYMBOL=SOL/USDT
+      - STATE_DIR=/app/state
+    env_file:
+      - .env   # TELEGRAM_TOKEN, BINANCE keys, etc -- shared secrets
+    volumes:
+      - ./state/sol:/app/state
+    restart: unless-stopped
+    mem_limit: 512m
+
+  bot-zec:
+    build: .
+    container_name: bot-zec
+    environment:
+      - SYMBOL=ZEC/USDT
+      - STATE_DIR=/app/state
+    env_file:
+      - .env
+    volumes:
+      - ./state/zec:/app/state
+    restart: unless-stopped
+    mem_limit: 512m
+
+  bot-btc:
+    build: .
+    container_name: bot-btc
+    environment:
+      - SYMBOL=BTC/USDT
+      - STATE_DIR=/app/state
+    env_file:
+      - .env
+    volumes:
+      - ./state/btc:/app/state
+    restart: unless-stopped
+    mem_limit: 512m

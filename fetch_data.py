@@ -4,7 +4,7 @@ import ccxt
 import pandas as pd
 import time
 
-def fetch_ohlcv(symbol='BANK/USDT', timeframe='5m', limit=1000):
+def fetch_ohlcv(symbol='ZEC/USDT', timeframe='5m', limit=1000):
     exchange  = ccxt.binance()
     all_ohlcv = []
     since     = None
