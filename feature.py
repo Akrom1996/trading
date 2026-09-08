@@ -4,8 +4,8 @@ import pandas as pd
 # Label horizon now matches the barrier model's 2-day window instead of
 # the old 15-minute (3-candle) target, so the direction signal and the
 # magnitude/probability model are answering the same question.
-LABEL_HORIZON_CANDLES = 288 * 2   # 2 days of 5-min candles
-LABEL_THRESHOLD       = 0.03      # +/-3% over the horizon counts as directional
+LABEL_HORIZON_CANDLES = 144   # 2 days of 5-min candles
+LABEL_THRESHOLD       = 0.015      # +/-3% over the horizon counts as directional
 
 
 def add_features(df):

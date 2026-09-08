@@ -31,7 +31,16 @@ MAX_TRADES_PER_DAY = 10
 TRAIN_CANDLES      = 2880
 LIVE_CANDLES       = 1000
 MAX_MODEL_AGE_HRS  = 12
-TRAIL_PCT          = 0.01   # trailing-stop distance below peak price
+
+# ── Pyramiding config (Option A) ──────────────────────────
+# Each position uses a fixed TP/SL (from barrier_model's TP_PCT/SL_PCT).
+# When price gets within PYRAMID_TRIGGER_PCT of an *unpyramided* open
+# position's TP, and the barrier model still confirms bullish, open a
+# NEW position at current price with its own fresh TP/SL. Repeat up to
+# MAX_PYRAMID_POSITIONS concurrent positions. Each rung is closed
+# independently on its own TP or SL.
+MAX_PYRAMID_POSITIONS = 6
+PYRAMID_TRIGGER_PCT   = 0.002  # trigger when price is within 0.2% of a position's TP
 
 
 def get_decimal_places(price: float) -> int:
@@ -84,6 +93,26 @@ def retrain_barrier_and_save():
     return barrier_model, barrier_scaler, barrier_encoder
 
 
+def normalize_position(pos: dict, decimals: int) -> dict:
+    """
+    Backward-compat: older saved positions (from the trailing-stop
+    version) have 'peak_price'/'trailing_stop' instead of 'take_profit'.
+    Restoring one of those after this rewrite would KeyError the first
+    time the pyramid-version code reads pos['take_profit']. Fill in
+    whatever's missing so a restart never crashes regardless of which
+    version of the bot originally wrote the file.
+    """
+    if 'take_profit' not in pos:
+        pos['take_profit'] = round(pos['entry'] * (1 + TP_PCT), decimals)
+    if 'stop_loss' not in pos:
+        pos['stop_loss'] = round(pos['entry'] * (1 - SL_PCT), decimals)
+    if 'pyramided' not in pos:
+        pos['pyramided'] = True  # unknown history -- don't let it spawn a surprise rung
+    pos.pop('peak_price', None)
+    pos.pop('trailing_stop', None)
+    return pos
+
+
 def close_position(pos, current_price, reason, daily_pnl):
     if pos['action'] == 'BUY':
         pnl = ((current_price - pos['entry']) / pos['entry']) * 100
@@ -100,7 +129,6 @@ def close_position(pos, current_price, reason, daily_pnl):
     send_message(msg)
     return daily_pnl + pnl
 
-
 def run_bot(model, scaler, encoder, barrier_model=None, barrier_scaler=None, barrier_encoder=None):
     # ── Restore state from disk if the process was restarted mid-trade ──
     saved_positions, saved_trades, saved_pnl, saved_day = load_positions(SYMBOL)
@@ -109,11 +137,21 @@ def run_bot(model, scaler, encoder, barrier_model=None, barrier_scaler=None, bar
         open_positions = saved_positions
         daily_trades   = saved_trades
         daily_pnl      = saved_pnl
+        # Normalize in case these were saved by an older schema (e.g. the
+        # trailing-stop version) -- prevents a KeyError on 'take_profit'.
+        if open_positions:
+            try:
+                _price_for_decimals = fetch_current_price(SYMBOL)
+                _decimals = get_decimal_places(_price_for_decimals)
+            except Exception:
+                _decimals = 4  # reasonable fallback if the API call fails here
+            open_positions = [normalize_position(p, _decimals) for p in open_positions]
         print(f"[{SYMBOL}] Restored {len(open_positions)} open position(s) "
               f"and today's counters from disk")
         if open_positions:
             send_message(f"🔄 <b>[{SYMBOL}] Restarted — restored "
                           f"{len(open_positions)} open position(s) from disk</b>")
+            save_positions(SYMBOL, open_positions, daily_trades, daily_pnl, saved_day)
     else:
         open_positions = []
         daily_trades   = 0
@@ -165,7 +203,7 @@ def run_bot(model, scaler, encoder, barrier_model=None, barrier_scaler=None, bar
                 notify_error(f"[{SYMBOL}] Barrier retrain failed: {e}")
                 print(f"[{SYMBOL}] [{now.strftime('%H:%M')}] Barrier retrain failed: {e}")
 
-        # ── Check open positions: trailing stop + hard SL safety net ──
+        # ── Check open positions: fixed TP / hard SL per rung ──
         try:
             current_price = fetch_current_price(SYMBOL)
             decimals      = get_decimal_places(current_price)
@@ -175,25 +213,76 @@ def run_bot(model, scaler, encoder, barrier_model=None, barrier_scaler=None, bar
                 if pos['action'] != 'BUY':
                     continue  # spot/long-only -- shouldn't happen, but be safe
 
-                # Ratchet the trailing stop up as price makes new highs
-                if current_price > pos['peak_price']:
-                    pos['peak_price'] = current_price
-                    candidate_trail = current_price * (1 - TRAIL_PCT)
-                    pos['trailing_stop'] = max(pos['trailing_stop'], candidate_trail)
-
-                if current_price <= pos['trailing_stop']:
-                    daily_pnl = close_position(pos, current_price, "Trailing Stop Hit", daily_pnl)
+                if current_price >= pos['take_profit']:
+                    daily_pnl = close_position(pos, current_price, "TP Hit", daily_pnl)
                     closed_positions.append(pos)
+                    # A profitable close frees up a trade slot -- otherwise
+                    # 10 winning round-trips in a row would permanently lock
+                    # the bot out for the rest of the day even at 0 open
+                    # positions in a still-bullish market.
+                    daily_trades = max(0, daily_trades - 1)
                 elif current_price <= pos['stop_loss']:
-                    # Hard safety-net SL -- protects against a fast gap-down
-                    # the trailing stop didn't get a chance to ratchet against
-                    daily_pnl = close_position(pos, current_price, "Hard SL Hit", daily_pnl)
+                    daily_pnl = close_position(pos, current_price, "SL Hit", daily_pnl)
                     closed_positions.append(pos)
+                    # Losses stay counted against the daily limit -- this is
+                    # what keeps a bad day from spiraling into over-trading.
 
             for pos in closed_positions:
                 open_positions.remove(pos)
             if closed_positions:
                 save_positions(SYMBOL, open_positions, daily_trades, daily_pnl, last_day)
+
+            # ── Pyramiding: open a new rung if price is closing in on an
+            # existing (unpyramided) position's TP and the barrier model
+            # still confirms bullish. Each position only spawns one child
+            # (flagged 'pyramided') so we don't fire a new rung every
+            # single minute once price is sitting near the trigger zone.
+            if (len(open_positions) < MAX_PYRAMID_POSITIONS
+                    and daily_trades < MAX_TRADES_PER_DAY
+                    and barrier_model is not None):
+                for pos in open_positions:
+                    if pos['action'] != 'BUY' or pos.get('pyramided'):
+                        continue
+                    near_tp = current_price >= pos['take_profit'] * (1 - PYRAMID_TRIGGER_PCT)
+                    if not near_tp:
+                        continue
+
+                    try:
+                        df_pyr = fetch_ohlcv(SYMBOL, '5m', limit=LIVE_CANDLES)
+                        df_pyr = add_features(df_pyr)
+                        barrier_probs = predict_barrier_probabilities(
+                            barrier_model, barrier_scaler, barrier_encoder, df_pyr
+                        )
+                        still_bullish, reason = should_enter(barrier_probs)
+                    except Exception as e:
+                        print(f"  ⚠️  Pyramid barrier check failed: {e}")
+                        still_bullish = False
+                        reason = "barrier check failed"
+
+                    pos['pyramided'] = True  # only ever try once per rung, hit or miss
+
+                    if still_bullish:
+                        new_entry = current_price
+                        new_tp    = round(new_entry * (1 + TP_PCT), decimals)
+                        new_sl    = round(new_entry * (1 - SL_PCT), decimals)
+                        open_positions.append({
+                            'action':      'BUY',
+                            'entry':       new_entry,
+                            'take_profit': new_tp,
+                            'stop_loss':   new_sl,
+                            'pyramided':   False,
+                            'opened_at':   now.strftime('%H:%M'),
+                        })
+                        daily_trades += 1
+                        send_message(
+                            f"🔼 <b>[{SYMBOL}] Pyramid entry #{len(open_positions)}</b>\n\n"
+                            f"💰 Entry: <b>{new_entry}</b>\n"
+                            f"🎯 TP:    <b>{new_tp}</b>\n"
+                            f"🛑 SL:    <b>{new_sl}</b>\n"
+                            f"📊 {reason}"
+                        )
+                        save_positions(SYMBOL, open_positions, daily_trades, daily_pnl, last_day)
+                    break  # only evaluate one candidate rung per loop tick
 
         except Exception as e:
             print(f"[{SYMBOL}] [{now.strftime('%H:%M')}] Position check error: {e}")
@@ -205,13 +294,12 @@ def run_bot(model, scaler, encoder, barrier_model=None, barrier_scaler=None, bar
                   f"Open positions: {open_count} | Price: {current_price}")
             # Send this summary once when the limit is first hit, not every
             # minute -- close_position() already messages Telegram the moment
-            # a trailing stop or hard SL actually fires, so a repeated
-            # "waiting" ping every 60s was pure noise on top of that.
+            # a TP or SL actually fires, so a repeated "waiting" ping every
+            # 60s was pure noise on top of that.
             if open_count > 0 and not limit_notice_sent:
                 pos_summary = "\n".join([
                     f"  🟢 BUY | Entry: {p['entry']} | "
-                    f"Peak: {p['peak_price']} | Trail: {p['trailing_stop']:.6g} | "
-                    f"Hard SL: {p['stop_loss']}"
+                    f"TP: {p['take_profit']} | SL: {p['stop_loss']}"
                     for p in open_positions
                 ])
                 send_message(
@@ -259,7 +347,17 @@ def run_bot(model, scaler, encoder, barrier_model=None, barrier_scaler=None, bar
                 decimals = get_decimal_places(current_price)
                 enter    = False
 
-                if barrier_model is not None:
+                # Only the pyramid logic (near an existing position's TP)
+                # should open additional positions once a stack is already
+                # running -- otherwise this signal-based check re-fires
+                # every single minute and opens unrelated fresh entries on
+                # top of the pyramid, regardless of price proximity to TP.
+                if len(open_positions) > 0:
+                    print(f"  ℹ️  Skipping fresh signal entry — "
+                          f"{len(open_positions)} position(s) already open "
+                          f"(new entries come from pyramiding only)")
+                    signal['action'] = None
+                elif barrier_model is not None:
                     try:
                         barrier_probs = predict_barrier_probabilities(
                             barrier_model, barrier_scaler, barrier_encoder, df
@@ -280,9 +378,8 @@ def run_bot(model, scaler, encoder, barrier_model=None, barrier_scaler=None, bar
 
             if signal['action'] == 'BUY':
                 signal['entry'] = current_price
-                # Hard SL stays as a safety net; there's no fixed TP anymore
-                # -- exits are via trailing stop once price has moved up.
-                signal['stop_loss'] = round(current_price * (1 - SL_PCT), decimals)
+                signal['take_profit'] = round(current_price * (1 + TP_PCT), decimals)
+                signal['stop_loss']   = round(current_price * (1 - SL_PCT), decimals)
 
             liq_info = f"Liq: {liq['bias']} ({liq['liq_ratio']:.0%})" if liq else "Liq: N/A"
             print(f"[{SYMBOL}] [{now.strftime('%H:%M')}] "
@@ -300,14 +397,14 @@ def run_bot(model, scaler, encoder, barrier_model=None, barrier_scaler=None, bar
                         level_text += (f"  {'⬆️' if lv['direction'] == 'ABOVE' else '⬇️'} "
                                         f"${lv['price']} ({lv['distance']}% away — ${lv['amount']:,.0f})\n")
 
-                notify_signal_with_liq(signal, daily_trades + 1, liq, level_text)
+                notify_signal_with_liq(signal, daily_trades + 1, liq, level_text, symbol=SYMBOL)
                 open_positions.append({
-                    'action':        signal['action'],
-                    'entry':         signal['entry'],
-                    'stop_loss':     signal['stop_loss'],
-                    'peak_price':    signal['entry'],
-                    'trailing_stop': signal['stop_loss'],
-                    'opened_at':     now.strftime('%H:%M'),
+                    'action':      signal['action'],
+                    'entry':       signal['entry'],
+                    'take_profit': signal['take_profit'],
+                    'stop_loss':   signal['stop_loss'],
+                    'pyramided':   False,
+                    'opened_at':   now.strftime('%H:%M'),
                 })
                 daily_trades += 1
                 save_positions(SYMBOL, open_positions, daily_trades, daily_pnl, last_day)
@@ -357,12 +454,12 @@ if __name__ == "__main__":
     else:
         print(f"  Saved barrier model found (trained {barrier_meta['trained_at']})")
 
-    notify_start()
+    notify_start(SYMBOL)
     print("Bot started. Press Ctrl+C to stop.")
     print("=" * 50)
 
     try:
         run_bot(model, scaler, encoder, barrier_model, barrier_scaler, barrier_encoder)
     except KeyboardInterrupt:
-        notify_stop()
+        notify_stop(SYMBOL)
         print("\nBot stopped by user")
