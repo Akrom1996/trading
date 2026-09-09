@@ -75,7 +75,7 @@ def notify_daily_limit():
 
 
 def notify_loss_limit():
-    send_message("🚨 <b>Daily loss limit hit (-6%), stopping for today</b>")
+    send_message("🚨 <b>Daily loss limit hit (-1.5%), stopping for today</b>")
 
 
 def notify_error(error: str):

@@ -26,7 +26,9 @@ from telegram_bot import (
 SYMBOL = os.getenv('SYMBOL', 'ZEC/USDT')
 
 MAX_RISK_PER_TRADE = 0.02
-MAX_DAILY_LOSS     = 0.06
+MAX_DAILY_LOSS     = 6      # percentage points -- daily_pnl accumulates as e.g. -1.5
+                             # for a -1.5% close, not as a 0.015 fraction, so this
+                             # must be in the same units or it trips on the first SL
 MAX_TRADES_PER_DAY = 10
 TRAIN_CANDLES      = 2880
 LIVE_CANDLES       = 1000
