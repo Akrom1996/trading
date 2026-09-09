@@ -27,15 +27,15 @@ services:
     restart: unless-stopped
     mem_limit: 512m
 
-  bot-btc:
+  bot-dash:
     build: .
-    container_name: bot-btc
+    container_name: bot-dash
     environment:
-      - SYMBOL=BTC/USDT
+      - SYMBOL=DASH/USDT
       - STATE_DIR=/app/state
     env_file:
       - .env
     volumes:
-      - ./state/btc:/app/state
+      - ./state/dash:/app/state
     restart: unless-stopped
     mem_limit: 512m

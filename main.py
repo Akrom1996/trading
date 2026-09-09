@@ -384,6 +384,7 @@ def run_bot(model, scaler, encoder, barrier_model=None, barrier_scaler=None, bar
             liq_info = f"Liq: {liq['bias']} ({liq['liq_ratio']:.0%})" if liq else "Liq: N/A"
             print(f"[{SYMBOL}] [{now.strftime('%H:%M')}] "
                   f"Signal: {signal['action'] or 'NONE':4} | "
+                  f"Pred: {signal['pred_label']:+d} | "
                   f"Confidence: {signal['confidence']:.2f} | "
                   f"Price: {current_price} | "
                   f"{liq_info} | "
