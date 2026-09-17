@@ -37,28 +37,41 @@ from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.utils.class_weight import compute_sample_weight
 from xgboost import XGBClassifier
 
-from trading_model import FEATURES  # reuse your existing feature set
+from trading_model import FEATURES  # reuse existing feature set
+from feature import FIBONACCI_LEVELS
 
 # ── Barrier configuration ──────────────────────────────────
 CANDLES_PER_DAY  = 288                  # 24h * 60min / 5min candles
-HORIZON_CANDLES  = CANDLES_PER_DAY // 2 # 12-hour forward window (was 2 days)
-TP_PCT           = 0.015                # +1.5% target
-SL_PCT           = 0.015                # -1.5% stop (was 1% -- too tight)
+HORIZON_CANDLES  = CANDLES_PER_DAY // 2 # 12-hour forward window
+DEFAULT_TP_PCT   = 0.03                 # default baseline target (+3% Fib)
+TP_PCT           = DEFAULT_TP_PCT       # backward compatibility alias
+SL_PCT           = 0.02                 # -2.0% stop (widened from 1.5% to avoid normal wick chop)
 
 LABEL_SL_FIRST = 0
-LABEL_TP_FIRST = 1
-LABEL_TIMEOUT  = 2
+LABEL_FIB_1    = 1   # +1%
+LABEL_FIB_2    = 2   # +2%
+LABEL_FIB_3    = 3   # +3%
+LABEL_FIB_5    = 4   # +5%
+LABEL_FIB_8    = 5   # +8%
+LABEL_FIB_13   = 6   # +13%
+LABEL_TIMEOUT  = 7
+
+# Backward compatibility alias for any caller referencing LABEL_TP_FIRST
+LABEL_TP_FIRST = LABEL_FIB_2
 
 LABEL_NAMES = {
     LABEL_SL_FIRST: f"SL_FIRST (-{SL_PCT*100:.1f}%)",
-    LABEL_TP_FIRST: f"TP_FIRST (+{TP_PCT*100:.1f}%)",
+    LABEL_FIB_1:    "TP_FIB_1 (+1%)",
+    LABEL_FIB_2:    "TP_FIB_2 (+2%)",
+    LABEL_FIB_3:    "TP_FIB_3 (+3%)",
+    LABEL_FIB_5:    "TP_FIB_5 (+5%)",
+    LABEL_FIB_8:    "TP_FIB_8 (+8%)",
+    LABEL_FIB_13:   "TP_FIB_13 (+13%)",
     LABEL_TIMEOUT:  "TIMEOUT",
 }
 
-# Warn if a class falls below this share of training examples -- XGBoost
-# can still learn from an imbalanced set, but under ~5% it tends to just
-# collapse toward always predicting the majority class.
-MIN_HEALTHY_CLASS_SHARE = 0.05
+# Warn if a class falls below this share of training examples
+MIN_HEALTHY_CLASS_SHARE = 0.03
 
 
 def _model_path(symbol: str) -> str:
@@ -69,11 +82,10 @@ def _model_path(symbol: str) -> str:
 
 
 def label_triple_barrier(df: pd.DataFrame, horizon=HORIZON_CANDLES,
-                          sl_pct=SL_PCT, tp_pct=TP_PCT):
+                          sl_pct=SL_PCT, tp_pct=DEFAULT_TP_PCT):
     """
-    Adds a 'barrier_label' column to df. Requires 'high', 'low', 'close'
-    columns. Drops the trailing `horizon` rows since they don't have a
-    full forward window to check yet -- return value is shorter than df.
+    Labels each candle with the highest Fibonacci target tier (1%, 2%, 3%, 5%, 8%, 13%)
+    reached before the stop-loss is hit within the forward horizon.
     """
     closes = df['close'].values
     highs  = df['high'].values
@@ -84,17 +96,36 @@ def label_triple_barrier(df: pd.DataFrame, horizon=HORIZON_CANDLES,
 
     for i in range(n - horizon):
         entry    = closes[i]
-        sl_price = entry * (1 - sl_pct)
-        tp_price = entry * (1 + tp_pct)
+        sl_price = entry * (1.0 - sl_pct)
 
-        label = LABEL_TIMEOUT
+        stopped_out = False
+        peak_gain = 0.0
+
         for j in range(i + 1, i + 1 + horizon):
             if lows[j] <= sl_price:
-                label = LABEL_SL_FIRST
+                stopped_out = True
                 break
-            if highs[j] >= tp_price:
-                label = LABEL_TP_FIRST
-                break
+            gain = (highs[j] - entry) / entry
+            if gain > peak_gain:
+                peak_gain = gain
+
+        if peak_gain >= 0.13:
+            label = LABEL_FIB_13
+        elif peak_gain >= 0.08:
+            label = LABEL_FIB_8
+        elif peak_gain >= 0.05:
+            label = LABEL_FIB_5
+        elif peak_gain >= 0.03:
+            label = LABEL_FIB_3
+        elif peak_gain >= 0.02:
+            label = LABEL_FIB_2
+        elif peak_gain >= 0.01:
+            label = LABEL_FIB_1
+        elif stopped_out:
+            label = LABEL_SL_FIRST
+        else:
+            label = LABEL_TIMEOUT
+
         labels[i] = label
 
     out = df.iloc[:n - horizon].copy()
@@ -144,13 +175,16 @@ def train_barrier_model(df: pd.DataFrame, symbol: str = None):
     # is exactly the "always predicts SL_FIRST" failure mode we saw live.
     sample_weight = compute_sample_weight(class_weight='balanced', y=y_encoded)
 
+    is_multiclass = num_classes > 2
     model = XGBClassifier(
         n_estimators=300,
         max_depth=5,
         learning_rate=0.05,
-        objective='multi:softprob',
-        num_class=num_classes,
+        objective='multi:softprob' if is_multiclass else 'binary:logistic',
+        num_class=num_classes if is_multiclass else None,
         eval_metric='mlogloss',
+        random_state=42,
+        n_jobs=-1
     )
     model.fit(X_scaled, y_encoded, sample_weight=sample_weight)
     return model, scaler, encoder, label_stats
@@ -176,8 +210,12 @@ def load_barrier_model(symbol: str, path: str = None):
     try:
         with open(path, 'rb') as f:
             data = pickle.load(f)
+        scaler = data.get('scaler')
+        if getattr(scaler, 'n_features_in_', None) != len(FEATURES):
+            print(f"  Feature set changed ({getattr(scaler, 'n_features_in_', '?')} -> {len(FEATURES)}), retraining barrier model...")
+            return None, None, None, None
         return data['model'], data['scaler'], data['encoder'], data
-    except FileNotFoundError:
+    except (FileNotFoundError, Exception) as e:
         return None, None, None, None
 
 
@@ -186,9 +224,8 @@ def predict_barrier_probabilities(model, scaler, encoder, df_latest: pd.DataFram
     df_latest: dataframe with features already added, at least 1 row.
     Uses the LAST row (most recent candle) for prediction.
 
-    Maps predict_proba's output back onto the full 3-outcome space so
-    a missing training class (e.g. no TP_FIRST examples) reports a
-    clean 0% instead of crashing or being silently dropped.
+    Calculates probabilities across all Fibonacci tiers (1%, 2%, 3%, 5%, 8%, 13%)
+    and returns dynamic recommended Take Profit based on the strongest probability.
     """
     X = df_latest[FEATURES].iloc[[-1]]
     X_scaled = scaler.transform(X)
@@ -198,19 +235,54 @@ def predict_barrier_probabilities(model, scaler, encoder, df_latest: pd.DataFram
     for col_idx, original_label in enumerate(encoder.classes_):
         full_probs[original_label] = float(raw_probs[col_idx])
 
+    p_fib_1  = full_probs[LABEL_FIB_1]
+    p_fib_2  = full_probs[LABEL_FIB_2]
+    p_fib_3  = full_probs[LABEL_FIB_3]
+    p_fib_5  = full_probs[LABEL_FIB_5]
+    p_fib_8  = full_probs[LABEL_FIB_8]
+    p_fib_13 = full_probs[LABEL_FIB_13]
+
+    # Total probability of achieving at least a profitable Fibonacci tier (+1% to +13%)
+    p_profitable = p_fib_1 + p_fib_2 + p_fib_3 + p_fib_5 + p_fib_8 + p_fib_13
+    # Probability of reaching higher extension tiers (>= 3%)
+    p_extended   = p_fib_3 + p_fib_5 + p_fib_8 + p_fib_13
+
+    # Recommend target tier based on probability mass
+    recommended_tp = 0.02
+    if p_fib_13 >= 0.12:
+        recommended_tp = 0.13
+    elif (p_fib_8 + p_fib_13) >= 0.15:
+        recommended_tp = 0.08
+    elif (p_fib_5 + p_fib_8 + p_fib_13) >= 0.20:
+        recommended_tp = 0.05
+    elif p_extended >= 0.25:
+        recommended_tp = 0.03
+    elif p_profitable >= 0.35:
+        recommended_tp = 0.02
+
     return {
-        'p_sl_first': round(full_probs[LABEL_SL_FIRST], 4),
-        'p_tp_first': round(full_probs[LABEL_TP_FIRST], 4),
-        'p_timeout':  round(full_probs[LABEL_TIMEOUT], 4),
+        'p_sl_first':     round(full_probs[LABEL_SL_FIRST], 4),
+        'p_tp_first':     round(p_profitable, 4),  # backward-compatible: overall profit probability
+        'p_extended':     round(p_extended, 4),
+        'p_timeout':      round(full_probs[LABEL_TIMEOUT], 4),
+        'p_fib_1':        round(p_fib_1, 4),
+        'p_fib_2':        round(p_fib_2, 4),
+        'p_fib_3':        round(p_fib_3, 4),
+        'p_fib_5':        round(p_fib_5, 4),
+        'p_fib_8':        round(p_fib_8, 4),
+        'p_fib_13':       round(p_fib_13, 4),
+        'recommended_tp': recommended_tp,
     }
 
 
-def should_enter(barrier_probs: dict, min_profit_prob=0.40):
+def should_enter(barrier_probs: dict, min_profit_prob=0.35):
     """
-    Spot/long-only decision rule: enter (BUY) only if P(+TP_PCT before
-    -SL_PCT) clears the threshold. Returns (should_buy: bool, reason: str).
+    Spot/long-only decision rule: enter (BUY) only if cumulative probability of
+    reaching a profitable Fibonacci level before stop-loss clears the threshold.
+    Returns (should_buy: bool, reason: str).
     """
     p = barrier_probs['p_tp_first']
+    rec_tp = barrier_probs.get('recommended_tp', DEFAULT_TP_PCT)
     if p >= min_profit_prob:
-        return True, f"P(+{TP_PCT*100:.1f}% before -{SL_PCT*100:.1f}%)={p:.0%} — entering"
-    return False, f"P(+{TP_PCT*100:.1f}% before -{SL_PCT*100:.1f}%)={p:.0%} below {min_profit_prob:.0%} threshold — skipping"
+        return True, f"P(Fib profit before -{SL_PCT*100:.1f}%)={p:.0%} (Target: +{rec_tp*100:.0f}%) — entering"
+    return False, f"P(Fib profit before -{SL_PCT*100:.1f}%)={p:.0%} below {min_profit_prob:.0%} threshold — skipping"

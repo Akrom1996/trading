@@ -1,0 +1,16 @@
+{
+  "open_positions": [
+    {
+      "action": "BUY",
+      "entry": 100.1,
+      "take_profit": 102.1,
+      "stop_loss": 98.1,
+      "pyramided": false,
+      "opened_at": "11:21"
+    }
+  ],
+  "daily_trades": 1,
+  "daily_pnl": 0.0,
+  "day": 17,
+  "saved_at": "2026-09-17T11:22:10.254221"
+}

@@ -82,15 +82,13 @@ def retrain_barrier_and_save():
                         symbol=SYMBOL, candles_count=len(df_barrier),
                         label_stats=label_stats)
 
-    # Surface class-imbalance directly in Telegram, not just console --
-    # this is what silently degraded the bot before (SL_FIRST pinned
-    # near 100%) and nobody noticed until price action made it obvious.
-    tp_pct = label_stats.get(f"TP_FIRST (+{TP_PCT*100:.1f}%)", {}).get('pct', 0)
-    if tp_pct < 5:
+    # Surface class-imbalance directly in Telegram, not just console
+    fib_tp_pct = sum(stats.get('pct', 0) for name, stats in label_stats.items() if 'TP_FIB' in name)
+    if fib_tp_pct < 5:
         send_message(
             f"⚠️ <b>[{SYMBOL}] Barrier model imbalance warning</b>\n"
-            f"TP_FIRST examples are only {tp_pct:.1f}% of training data — "
-            f"live probabilities may stay stuck near 0%."
+            f"Profitable Fibonacci examples are only {fib_tp_pct:.1f}% of training data — "
+            f"live probabilities may stay low."
         )
     return barrier_model, barrier_scaler, barrier_encoder
 
@@ -131,6 +129,7 @@ def close_position(pos, current_price, reason, daily_pnl):
     send_message(msg)
     return daily_pnl + pnl
 
+
 def run_bot(model, scaler, encoder, barrier_model=None, barrier_scaler=None, barrier_encoder=None):
     # ── Restore state from disk if the process was restarted mid-trade ──
     saved_positions, saved_trades, saved_pnl, saved_day = load_positions(SYMBOL)
@@ -139,8 +138,7 @@ def run_bot(model, scaler, encoder, barrier_model=None, barrier_scaler=None, bar
         open_positions = saved_positions
         daily_trades   = saved_trades
         daily_pnl      = saved_pnl
-        # Normalize in case these were saved by an older schema (e.g. the
-        # trailing-stop version) -- prevents a KeyError on 'take_profit'.
+        # Normalize in case these were saved by an older schema
         if open_positions:
             try:
                 _price_for_decimals = fetch_current_price(SYMBOL)
@@ -190,7 +188,7 @@ def run_bot(model, scaler, encoder, barrier_model=None, barrier_scaler=None, bar
                 probas   = model.predict_proba(X_scaled)
                 avg_conf = probas.max(axis=1).mean()
                 max_conf = probas.max(axis=1).max()
-                notify_retrain(TRAIN_CANDLES, avg_conf, max_conf)
+                # notify_retrain(TRAIN_CANDLES, avg_conf, max_conf)
                 print(f"[{SYMBOL}] [{now.strftime('%H:%M')}] Model retrained and saved")
             except Exception as e:
                 notify_error(f"[{SYMBOL}] {e}")
@@ -205,9 +203,14 @@ def run_bot(model, scaler, encoder, barrier_model=None, barrier_scaler=None, bar
                 notify_error(f"[{SYMBOL}] Barrier retrain failed: {e}")
                 print(f"[{SYMBOL}] [{now.strftime('%H:%M')}] Barrier retrain failed: {e}")
 
-        # ── Check open positions: fixed TP / hard SL per rung ──
+        # ── Check open positions: using Candle High/Low to catch wicks ──
         try:
-            current_price = fetch_current_price(SYMBOL)
+            # Fetch recent 5m candle data to capture the latest High/Low wicks
+            df_recent = fetch_ohlcv(SYMBOL, '5m', limit=2)
+            latest_candle = df_recent.iloc[-1]
+            candle_high   = float(latest_candle['high'])
+            candle_low    = float(latest_candle['low'])
+            current_price = float(latest_candle['close'])
             decimals      = get_decimal_places(current_price)
 
             closed_positions = []
@@ -215,19 +218,20 @@ def run_bot(model, scaler, encoder, barrier_model=None, barrier_scaler=None, bar
                 if pos['action'] != 'BUY':
                     continue  # spot/long-only -- shouldn't happen, but be safe
 
-                if current_price >= pos['take_profit']:
-                    daily_pnl = close_position(pos, current_price, "TP Hit", daily_pnl)
+                # 1. Check if the candle high wick reached/passed Take Profit
+                if candle_high >= pos['take_profit']:
+                    # Close at exact TP target price to accurately simulate a limit order fill
+                    daily_pnl = close_position(pos, pos['take_profit'], "TP Hit (Candle High)", daily_pnl)
                     closed_positions.append(pos)
-                    # A profitable close frees up a trade slot -- otherwise
-                    # 10 winning round-trips in a row would permanently lock
-                    # the bot out for the rest of the day even at 0 open
-                    # positions in a still-bullish market.
+                    # A profitable close frees up a trade slot
                     daily_trades = max(0, daily_trades - 1)
-                elif current_price <= pos['stop_loss']:
-                    daily_pnl = close_position(pos, current_price, "SL Hit", daily_pnl)
+
+                # 2. Check if the candle low wick reached/passed Stop Loss
+                elif candle_low <= pos['stop_loss']:
+                    # Close at exact SL target price
+                    daily_pnl = close_position(pos, pos['stop_loss'], "SL Hit (Candle Low)", daily_pnl)
                     closed_positions.append(pos)
-                    # Losses stay counted against the daily limit -- this is
-                    # what keeps a bad day from spiraling into over-trading.
+                    # Losses stay counted against the daily limit
 
             for pos in closed_positions:
                 open_positions.remove(pos)
@@ -236,9 +240,7 @@ def run_bot(model, scaler, encoder, barrier_model=None, barrier_scaler=None, bar
 
             # ── Pyramiding: open a new rung if price is closing in on an
             # existing (unpyramided) position's TP and the barrier model
-            # still confirms bullish. Each position only spawns one child
-            # (flagged 'pyramided') so we don't fire a new rung every
-            # single minute once price is sitting near the trigger zone.
+            # still confirms bullish.
             if (len(open_positions) < MAX_PYRAMID_POSITIONS
                     and daily_trades < MAX_TRADES_PER_DAY
                     and barrier_model is not None):
@@ -265,7 +267,8 @@ def run_bot(model, scaler, encoder, barrier_model=None, barrier_scaler=None, bar
 
                     if still_bullish:
                         new_entry = current_price
-                        new_tp    = round(new_entry * (1 + TP_PCT), decimals)
+                        rung_tp_pct = barrier_probs.get('recommended_tp', TP_PCT)
+                        new_tp    = round(new_entry * (1 + rung_tp_pct), decimals)
                         new_sl    = round(new_entry * (1 - SL_PCT), decimals)
                         open_positions.append({
                             'action':      'BUY',
@@ -279,7 +282,7 @@ def run_bot(model, scaler, encoder, barrier_model=None, barrier_scaler=None, bar
                         send_message(
                             f"🔼 <b>[{SYMBOL}] Pyramid entry #{len(open_positions)}</b>\n\n"
                             f"💰 Entry: <b>{new_entry}</b>\n"
-                            f"🎯 TP:    <b>{new_tp}</b>\n"
+                            f"🎯 TP:    <b>{new_tp} (+{rung_tp_pct*100:.0f}% Fib)</b>\n"
                             f"🛑 SL:    <b>{new_sl}</b>\n"
                             f"📊 {reason}"
                         )
@@ -294,10 +297,6 @@ def run_bot(model, scaler, encoder, barrier_model=None, barrier_scaler=None, bar
             open_count = len(open_positions)
             print(f"[{SYMBOL}] [{now.strftime('%H:%M')}] Max trades reached | "
                   f"Open positions: {open_count} | Price: {current_price}")
-            # Send this summary once when the limit is first hit, not every
-            # minute -- close_position() already messages Telegram the moment
-            # a TP or SL actually fires, so a repeated "waiting" ping every
-            # 60s was pure noise on top of that.
             if open_count > 0 and not limit_notice_sent:
                 pos_summary = "\n".join([
                     f"  🟢 BUY | Entry: {p['entry']} | "
@@ -349,11 +348,6 @@ def run_bot(model, scaler, encoder, barrier_model=None, barrier_scaler=None, bar
                 decimals = get_decimal_places(current_price)
                 enter    = False
 
-                # Only the pyramid logic (near an existing position's TP)
-                # should open additional positions once a stack is already
-                # running -- otherwise this signal-based check re-fires
-                # every single minute and opens unrelated fresh entries on
-                # top of the pyramid, regardless of price proximity to TP.
                 if len(open_positions) > 0:
                     print(f"  ℹ️  Skipping fresh signal entry — "
                           f"{len(open_positions)} position(s) already open "
@@ -365,9 +359,16 @@ def run_bot(model, scaler, encoder, barrier_model=None, barrier_scaler=None, bar
                             barrier_model, barrier_scaler, barrier_encoder, df
                         )
                         enter, reason = should_enter(barrier_probs)
+                        rec_tp = barrier_probs.get('recommended_tp', TP_PCT)
                         print(f"  📊 Barrier probs: "
                               f"SL={barrier_probs['p_sl_first']:.0%} "
-                              f"TP={barrier_probs['p_tp_first']:.0%} "
+                              f"FibProfit={barrier_probs['p_tp_first']:.0%} "
+                              f"(1%:{barrier_probs.get('p_fib_1', 0):.0%}, "
+                              f"2%:{barrier_probs.get('p_fib_2', 0):.0%}, "
+                              f"3%:{barrier_probs.get('p_fib_3', 0):.0%}, "
+                              f"5%:{barrier_probs.get('p_fib_5', 0):.0%}, "
+                              f"8%:{barrier_probs.get('p_fib_8', 0):.0%}, "
+                              f"13%:{barrier_probs.get('p_fib_13', 0):.0%}) "
                               f"timeout={barrier_probs['p_timeout']:.0%} — {reason}")
                     except Exception as e:
                         print(f"  ⚠️  Barrier prediction failed: {e}")
@@ -379,8 +380,13 @@ def run_bot(model, scaler, encoder, barrier_model=None, barrier_scaler=None, bar
                     signal['action'] = None
 
             if signal['action'] == 'BUY':
-                signal['entry'] = current_price
-                signal['take_profit'] = round(current_price * (1 + TP_PCT), decimals)
+                model_tp = signal.get('fib_target_pct', 0.03)
+                barrier_tp = barrier_probs.get('recommended_tp', 0.03) if barrier_model is not None else model_tp
+                effective_tp = max(model_tp, barrier_tp)
+
+                signal['fib_target_pct'] = effective_tp
+                signal['entry']       = current_price
+                signal['take_profit'] = round(current_price * (1 + effective_tp), decimals)
                 signal['stop_loss']   = round(current_price * (1 - SL_PCT), decimals)
 
             liq_info = f"Liq: {liq['bias']} ({liq['liq_ratio']:.0%})" if liq else "Liq: N/A"

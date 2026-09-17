@@ -5,12 +5,16 @@ from xgboost import XGBClassifier
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.utils.class_weight import compute_sample_weight
 
+from feature import FIB_TIER_NAMES
+
 FEATURES = [
     'rsi', 'rsi_diff', 'macd', 'stoch',
     'ema_9', 'ema_21', 'ema_50', 'ema_cross',
-    'atr', 'bb_high', 'bb_low', 'bb_width',
-    'obv', 'vwap', 'vol_ratio',
-    'candle_body', 'price_pos', 'volume'
+    'atr', 'atr_ratio', 'bb_high', 'bb_low', 'bb_width',
+    'obv', 'vwap', 'vol_ratio', 'vol_ratio_15m',
+    'candle_body', 'price_pos', 'volume',
+    'return_5m', 'return_15m', 'return_30m', 'return_1h',
+    'range_15m',
 ]
 
 
@@ -28,26 +32,35 @@ def _paths(symbol: str):
 
 
 def train_model(df):
-    print(f"  Label distribution:\n{df['label'].value_counts()}")
+    print(f"  Label distribution (Fibonacci Tiers):")
+    total = len(df)
+    for tier, name in FIB_TIER_NAMES.items():
+        count = int((df['label'] == tier).sum())
+        pct = (count / total * 100) if total else 0.0
+        if count > 0:
+            print(f"    Tier {tier} ({name:22s}): {count:5d} ({pct:.1f}%)")
 
     X = df[FEATURES]
     y = df['label']
 
-    # XGBoost needs labels 0,1,2 not -1,0,1
     encoder = LabelEncoder()
     y_encoded = encoder.fit_transform(y)
+    num_classes = len(encoder.classes_)
 
-    sample_weights = compute_sample_weight(class_weight='balanced', y=y)
+    sample_weights = compute_sample_weight(class_weight='balanced', y=y_encoded)
 
     scaler   = StandardScaler()
     X_scaled = scaler.fit_transform(X)
 
+    is_multiclass = num_classes > 2
     model = XGBClassifier(
         n_estimators=300,
-        max_depth=4,
+        max_depth=5,
         learning_rate=0.05,
         subsample=0.8,
         colsample_bytree=0.8,
+        objective='multi:softprob' if is_multiclass else 'binary:logistic',
+        num_class=num_classes if is_multiclass else None,
         eval_metric='mlogloss',
         random_state=42,
         n_jobs=-1
@@ -89,6 +102,10 @@ def load_model(symbol: str):
         encoder = pickle.load(f)
     with open(paths['metadata'], 'rb') as f:
         metadata = pickle.load(f)
+
+    if getattr(scaler, 'n_features_in_', None) != len(FEATURES):
+        print(f"  Feature set changed ({getattr(scaler, 'n_features_in_', '?')} -> {len(FEATURES)}), retraining model...")
+        return None, None, None, None
 
     return model, scaler, encoder, metadata
 

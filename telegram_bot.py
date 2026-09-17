@@ -18,12 +18,17 @@ def notify_signal_with_liq(signal, daily_trades, liq, level_text='',symbol=''):
             f"  💬 {liq['comment']}"
         )
 
+    fib_target = signal.get('fib_target_pct')
+    fib_str = f" (+{fib_target*100:.0f}% Fib)" if fib_target else ""
+    p_bull = signal.get('p_bullish')
+    conf_str = f"{signal['confidence']:.0%}" + (f" (Bullish: {p_bull:.0%})" if p_bull else "")
+
     msg = (
         f"{emoji} <b>{signal['action']} Signal — {symbol}</b>\n\n"
         f"💰 Entry:       <b>{signal['entry']}</b>\n"
-        f"🎯 Take Profit: <b>{signal['take_profit']}</b>\n"
+        f"🎯 Take Profit: <b>{signal['take_profit']}</b>{fib_str}\n"
         f"🛑 Stop Loss:   <b>{signal['stop_loss']}</b>\n"
-        f"📊 Confidence:  <b>{signal['confidence']:.0%}</b>\n"
+        f"📊 Confidence:  <b>{conf_str}</b>\n"
         f"🔢 Trade:       <b>{daily_trades}/8</b>"
         f"{liq_section}"
         f"{level_text}"
