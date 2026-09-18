@@ -2,15 +2,15 @@
   "open_positions": [
     {
       "action": "BUY",
-      "entry": 100.1,
-      "take_profit": 102.1,
-      "stop_loss": 98.1,
+      "entry": 105.53,
+      "take_profit": 108.7,
+      "stop_loss": 103.42,
       "pyramided": false,
-      "opened_at": "11:21"
+      "opened_at": "05:58"
     }
   ],
   "daily_trades": 1,
-  "daily_pnl": 0.0,
-  "day": 17,
-  "saved_at": "2026-09-17T11:22:10.254221"
+  "daily_pnl": 1.998001998001998,
+  "day": 18,
+  "saved_at": "2026-09-18T07:23:36.558684"
 }
