@@ -7,3 +7,4 @@ python-telegram-bot
 ccxt
 requests
 ta
+apscheduler

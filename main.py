@@ -14,12 +14,13 @@ from barrier_model import (
     train_barrier_model, save_barrier_model, load_barrier_model,
     predict_barrier_probabilities, should_enter, TP_PCT, SL_PCT
 )
-from positions import save_positions, load_positions
+# from positions import save_positions, load_positions
 from telegram_bot import (
     notify_signal_with_liq, notify_signal, notify_retrain, notify_daily_limit,
     notify_loss_limit, notify_error, notify_start, notify_stop,
     send_message
 )
+from db import init_db, save_bot_state, load_bot_state, record_closed_trade
 
 # ── Symbol: set via env var so the SAME image runs any coin ──
 # docker run -e SYMBOL=SOL/USDT ...  (see docker-compose.yml)
@@ -114,10 +115,10 @@ def normalize_position(pos: dict, decimals: int) -> dict:
 
 
 def close_position(pos, current_price, reason, daily_pnl):
-    if pos['action'] == 'BUY':
-        pnl = ((current_price - pos['entry']) / pos['entry']) * 100
+    if pos["action"] == "BUY":
+        pnl = ((current_price - pos["entry"]) / pos["entry"]) * 100
     else:
-        pnl = ((pos['entry'] - current_price) / pos['entry']) * 100
+        pnl = ((pos["entry"] - current_price) / pos["entry"]) * 100
 
     icon = "✅" if pnl >= 0 else "🛑"
     msg = (
@@ -127,12 +128,23 @@ def close_position(pos, current_price, reason, daily_pnl):
         f"📈 PnL:    <b>{pnl:+.2f}%</b>"
     )
     send_message(msg)
+
+    # Record trade into permanent SQLite history
+    record_closed_trade(
+        symbol=SYMBOL,
+        action=pos["action"],
+        entry=pos["entry"],
+        exit_price=current_price,
+        pnl_pct=pnl,
+        reason=reason,
+    )
+
     return daily_pnl + pnl
 
 
 def run_bot(model, scaler, encoder, barrier_model=None, barrier_scaler=None, barrier_encoder=None):
     # ── Restore state from disk if the process was restarted mid-trade ──
-    saved_positions, saved_trades, saved_pnl, saved_day = load_positions(SYMBOL)
+    saved_positions, saved_trades, saved_pnl, saved_day = load_bot_state(SYMBOL)
     now0 = datetime.now()
     if saved_positions or saved_day == now0.day:
         open_positions = saved_positions
@@ -151,7 +163,7 @@ def run_bot(model, scaler, encoder, barrier_model=None, barrier_scaler=None, bar
         if open_positions:
             send_message(f"🔄 <b>[{SYMBOL}] Restarted — restored "
                           f"{len(open_positions)} open position(s) from disk</b>")
-            save_positions(SYMBOL, open_positions, daily_trades, daily_pnl, saved_day)
+            save_bot_state(SYMBOL, open_positions, daily_trades, daily_pnl, saved_day)
     else:
         open_positions = []
         daily_trades   = 0
@@ -173,7 +185,7 @@ def run_bot(model, scaler, encoder, barrier_model=None, barrier_scaler=None, bar
             limit_notice_sent = False
             print(f"[{SYMBOL}] [{now.strftime('%H:%M')}] Daily counters reset")
             send_message(f"🔄 <b>[{SYMBOL}] Daily counters reset</b>")
-            save_positions(SYMBOL, open_positions, daily_trades, daily_pnl, last_day)
+            save_bot_state(SYMBOL, open_positions, daily_trades, daily_pnl, last_day)
 
         # ── Retrain every 1 hour ──────────────────────────────
         minutes_since_retrain = (now - last_retrain).seconds / 60
@@ -236,7 +248,7 @@ def run_bot(model, scaler, encoder, barrier_model=None, barrier_scaler=None, bar
             for pos in closed_positions:
                 open_positions.remove(pos)
             if closed_positions:
-                save_positions(SYMBOL, open_positions, daily_trades, daily_pnl, last_day)
+                save_bot_state(SYMBOL, open_positions, daily_trades, daily_pnl, last_day)
 
             # ── Pyramiding: open a new rung if price is closing in on an
             # existing (unpyramided) position's TP and the barrier model
@@ -286,7 +298,7 @@ def run_bot(model, scaler, encoder, barrier_model=None, barrier_scaler=None, bar
                             f"🛑 SL:    <b>{new_sl}</b>\n"
                             f"📊 {reason}"
                         )
-                        save_positions(SYMBOL, open_positions, daily_trades, daily_pnl, last_day)
+                        save_bot_state(SYMBOL, open_positions, daily_trades, daily_pnl, last_day)
                     break  # only evaluate one candidate rung per loop tick
 
         except Exception as e:
@@ -416,7 +428,7 @@ def run_bot(model, scaler, encoder, barrier_model=None, barrier_scaler=None, bar
                     'opened_at':   now.strftime('%H:%M'),
                 })
                 daily_trades += 1
-                save_positions(SYMBOL, open_positions, daily_trades, daily_pnl, last_day)
+                save_bot_state(SYMBOL, open_positions, daily_trades, daily_pnl, last_day)
 
         except Exception as e:
             notify_error(f"[{SYMBOL}] {e}")
@@ -429,6 +441,8 @@ if __name__ == "__main__":
     print("=" * 50)
     print(f"  {SYMBOL} Trading Bot")
     print("=" * 50)
+
+    init_db()
 
     print("Checking for saved model...")
     model, scaler, encoder, metadata = load_model(symbol=SYMBOL)
