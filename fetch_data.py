@@ -4,7 +4,7 @@ import ccxt
 import pandas as pd
 import time
 
-def fetch_ohlcv(symbol='ZEC/USDT', timeframe='5m', limit=1000):
+def fetch_ohlcv(symbol='ONE/USDT', timeframe='5m', limit=1000):
     exchange  = ccxt.binance()
     all_ohlcv = []
     since     = None
@@ -40,7 +40,7 @@ def _timeframe_to_ms(timeframe):
     return int(timeframe[:-1]) * units[timeframe[-1]] * 1000
 
 
-def fetch_current_price(symbol='ZEC/USDT'):
+def fetch_current_price(symbol='ONE/USDT'):
     exchange = ccxt.binance()
     ticker   = exchange.fetch_ticker(symbol)
     return ticker['last']

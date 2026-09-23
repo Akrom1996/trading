@@ -1,0 +1,34 @@
+name: Deploy Trading Bot to Hetzner
+
+on:
+  push:
+    branches:
+      - main  # Triggers when code is merged or pushed to main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Deploy to Hetzner via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.HETZNER_HOST }}
+          username: ${{ secrets.HETZNER_USER }}
+          key: ${{ secrets.HETZNER_SSH_KEY }}
+          port: ${{ secrets.HETZNER_PORT }}
+          script: |
+            # Navigate to project directory (change path to match your server setup)
+            cd /root/app
+
+            # Pull latest changes from main branch
+            git pull origin main
+
+            # Rebuild images & restart containers gracefully
+            docker-compose up -d --build --remove-orphans
+
+            # Clean up old unused Docker images to save Hetzner disk space
+            docker image prune -f

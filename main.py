@@ -24,7 +24,7 @@ from db import init_db, save_bot_state, load_bot_state, record_closed_trade
 
 # ── Symbol: set via env var so the SAME image runs any coin ──
 # docker run -e SYMBOL=SOL/USDT ...  (see docker-compose.yml)
-SYMBOL = os.getenv('SYMBOL', 'ZEC/USDT')
+SYMBOL = os.getenv('SYMBOL', 'ONE/USDT')
 
 MAX_RISK_PER_TRADE = 0.02
 MAX_DAILY_LOSS     = 6      # percentage points -- daily_pnl accumulates as e.g. -1.5
@@ -477,7 +477,7 @@ if __name__ == "__main__":
     else:
         print(f"  Saved barrier model found (trained {barrier_meta['trained_at']})")
 
-    notify_start(SYMBOL)
+    # notify_start(SYMBOL)
     print("Bot started. Press Ctrl+C to stop.")
     print("=" * 50)
 

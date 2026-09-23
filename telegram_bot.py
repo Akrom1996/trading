@@ -55,7 +55,7 @@ def notify_signal(signal, daily_trades):
         emoji = '🔴'
 
     msg = (
-        f"{emoji} <b>{signal['action']} Signal — ZEC/USDT</b>\n\n"
+        f"{emoji} <b>{signal['action']} Signal — ONE/USDT</b>\n\n"
         f"💰 Entry:       <b>{signal['entry']}</b>\n"
         f"🎯 Take Profit: <b>{signal['take_profit']}</b>\n"
         f"🛑 Stop Loss:   <b>{signal['stop_loss']}</b>\n"
