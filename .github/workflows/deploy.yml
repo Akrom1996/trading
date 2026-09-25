@@ -3,7 +3,7 @@ name: Deploy Trading Bot to Hetzner
 on:
   push:
     branches:
-      - main  # Triggers when code is merged or pushed to main
+      - main
 
 jobs:
   deploy:
@@ -11,7 +11,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5 
+        uses: actions/checkout@v5
 
       - name: Deploy to Hetzner via SSH
         uses: appleboy/ssh-action@v1.0.3
@@ -20,18 +20,50 @@ jobs:
           username: ${{ secrets.HETZNER_USER }}
           key: ${{ secrets.HETZNER_SSH_KEY }}
           port: ${{ secrets.HETZNER_PORT }}
-          script: |
-            # Navigate to project directory
-            cd /root/app
+          command_timeout: 30m
+          debug: true
 
-            # Fetch and reset hard to origin/main to prevent local git merge conflicts
+          script: |
+            set -euxo pipefail
+
+            echo "=== SERVER ==="
+            hostname
+            whoami
+            pwd
+
+            echo "=== DOCKER ==="
+            command -v docker
+            docker --version
+            docker compose version
+            docker info
+
+            echo "=== PROJECT ==="
+            cd /root/app
+            pwd
+            git status
             git fetch origin main
             git reset --hard origin/main
 
-            # Force rebuild without layer cache & recreate containers
+            echo "=== COMPOSE CONFIG ==="
+            docker compose config
+
+            echo "=== BUILD ==="
             docker compose build --no-cache
+
+            echo "=== START ==="
             docker compose up -d --force-recreate --remove-orphans
 
-            # Clean up dangling images and unused build cache
+            echo "=== CONTAINERS ==="
+            docker compose ps
+            docker ps -a
+
+            echo "=== LOGS ==="
+            docker compose logs --tail=100
+
+            echo "=== CLEANUP ==="
             docker image prune -f
             docker builder prune -f
+
+            echo "=== FINAL ==="
+            docker compose ps
+            docker ps
