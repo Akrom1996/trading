@@ -21,14 +21,17 @@ jobs:
           key: ${{ secrets.HETZNER_SSH_KEY }}
           port: ${{ secrets.HETZNER_PORT }}
           script: |
-            # Navigate to project directory (change path to match your server setup)
+            # Navigate to project directory
             cd /root/app
 
-            # Pull latest changes from main branch
-            git pull origin main
+            # Fetch and reset hard to origin/main to prevent local git merge conflicts
+            git fetch origin main
+            git reset --hard origin/main
 
-            # Rebuild images & restart containers gracefully
-            docker-compose up -d --build --remove-orphans
+            # Force rebuild without layer cache & recreate containers
+            docker compose build --no-cache
+            docker compose up -d --force-recreate --remove-orphans
 
-            # Clean up old unused Docker images to save Hetzner disk space
+            # Clean up dangling images and unused build cache
             docker image prune -f
+            docker builder prune -f
