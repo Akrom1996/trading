@@ -147,9 +147,9 @@ def run_bot(model, scaler, encoder, barrier_model=None, barrier_scaler=None, bar
     saved_positions, saved_trades, saved_pnl, saved_day = load_bot_state(SYMBOL)
     now0 = datetime.now()
     if saved_positions or saved_day == now0.day:
-        open_positions = saved_positions
-        daily_trades   = saved_trades
-        daily_pnl      = saved_pnl
+        open_positions = saved_positions or []
+        daily_trades   = saved_trades if saved_day == now0.day else 0
+        daily_pnl      = saved_pnl if saved_day == now0.day else 0.0
         # Normalize in case these were saved by an older schema
         if open_positions:
             try:
@@ -159,11 +159,11 @@ def run_bot(model, scaler, encoder, barrier_model=None, barrier_scaler=None, bar
                 _decimals = 4  # reasonable fallback if the API call fails here
             open_positions = [normalize_position(p, _decimals) for p in open_positions]
         print(f"[{SYMBOL}] Restored {len(open_positions)} open position(s) "
-              f"and today's counters from disk")
+              f"and today's counters from SQLite")
         if open_positions:
             send_message(f"🔄 <b>[{SYMBOL}] Restarted — restored "
-                          f"{len(open_positions)} open position(s) from disk</b>")
-            save_bot_state(SYMBOL, open_positions, daily_trades, daily_pnl, saved_day)
+                          f"{len(open_positions)} open position(s) from SQLite</b>")
+            save_bot_state(SYMBOL, open_positions, daily_trades, daily_pnl, now0.day)
     else:
         open_positions = []
         daily_trades   = 0
@@ -181,10 +181,10 @@ def run_bot(model, scaler, encoder, barrier_model=None, barrier_scaler=None, bar
             daily_trades   = 0
             daily_pnl      = 0.0
             last_day       = now.day
-            open_positions = []
             limit_notice_sent = False
-            print(f"[{SYMBOL}] [{now.strftime('%H:%M')}] Daily counters reset")
-            send_message(f"🔄 <b>[{SYMBOL}] Daily counters reset</b>")
+            print(f"[{SYMBOL}] [{now.strftime('%H:%M')}] Daily counters reset (holding {len(open_positions)} open position(s))")
+            holding_msg = f"\nHolding <b>{len(open_positions)}</b> open position(s) into the new day." if open_positions else ""
+            send_message(f"🔄 <b>[{SYMBOL}] Daily counters reset</b>{holding_msg}")
             save_bot_state(SYMBOL, open_positions, daily_trades, daily_pnl, last_day)
 
         # ── Retrain every 1 hour ──────────────────────────────
@@ -197,9 +197,9 @@ def run_bot(model, scaler, encoder, barrier_model=None, barrier_scaler=None, bar
                 df_test  = fetch_ohlcv(SYMBOL, '5m', limit=200)
                 df_test  = add_features(df_test)
                 X_scaled = scaler.transform(df_test[FEATURES])
-                probas   = model.predict_proba(X_scaled)
-                avg_conf = probas.max(axis=1).mean()
-                max_conf = probas.max(axis=1).max()
+                # probas   = model.predict_proba(X_scaled)
+                # avg_conf = probas.max(axis=1).mean()
+                # max_conf = probas.max(axis=1).max()
                 # notify_retrain(TRAIN_CANDLES, avg_conf, max_conf)
                 print(f"[{SYMBOL}] [{now.strftime('%H:%M')}] Model retrained and saved")
             except Exception as e:
