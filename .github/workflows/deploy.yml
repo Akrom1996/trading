@@ -38,7 +38,7 @@ jobs:
             docker info
 
             echo "=== PROJECT ==="
-            cd /root/app
+            cd /root/trading
             pwd
             git status
             git fetch origin main
