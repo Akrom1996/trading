@@ -7,7 +7,9 @@ DB_PATH = os.getenv("DB_PATH", "data/bot_data.db")
 
 def get_connection():
     # Ensure directory exists
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    dir_name = os.path.dirname(DB_PATH)
+    if dir_name:
+        os.makedirs(dir_name, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL;")
@@ -22,7 +24,8 @@ def init_db():
         # State table: maintains current open positions and daily state per symbol
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS symbol_state (
-                symbol TEXT PRIMARY KEY,
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT UNIQUE NOT NULL,
                 open_positions TEXT NOT NULL,
                 daily_trades INTEGER NOT NULL,
                 daily_pnl REAL NOT NULL,
@@ -30,6 +33,28 @@ def init_db():
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+
+        # Migration: if table already existed without 'id', migrate it safely
+        cursor.execute("PRAGMA table_info(symbol_state)")
+        columns = [row["name"] for row in cursor.fetchall()]
+        if columns and "id" not in columns:
+            cursor.execute("""
+                CREATE TABLE symbol_state_migrated (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    symbol TEXT UNIQUE NOT NULL,
+                    open_positions TEXT NOT NULL,
+                    daily_trades INTEGER NOT NULL,
+                    daily_pnl REAL NOT NULL,
+                    day INTEGER NOT NULL,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            cursor.execute("""
+                INSERT INTO symbol_state_migrated (symbol, open_positions, daily_trades, daily_pnl, day, updated_at)
+                SELECT symbol, open_positions, daily_trades, daily_pnl, day, updated_at FROM symbol_state
+            """)
+            cursor.execute("DROP TABLE symbol_state")
+            cursor.execute("ALTER TABLE symbol_state_migrated RENAME TO symbol_state")
 
         # History table: logs every closed trade permanently across all coins
         cursor.execute("""
