@@ -20,7 +20,7 @@ from telegram_bot import (
     notify_loss_limit, notify_error, notify_start, notify_stop,
     send_message
 )
-from db import init_db, save_bot_state, load_bot_state, record_closed_trade
+from db import init_db, save_bot_state, load_bot_state, record_closed_trade, get_last_sl_time
 
 # ── Symbol: set via env var so the SAME image runs any coin ──
 # docker run -e SYMBOL=SOL/USDT ...  (see docker-compose.yml)
@@ -34,6 +34,7 @@ MAX_TRADES_PER_DAY = 10
 TRAIN_CANDLES      = 2880
 LIVE_CANDLES       = 1000
 MAX_MODEL_AGE_HRS  = 12
+SL_COOLDOWN_MINUTES = 60     # Pause signal generation for 1 hour after Stop Loss hit
 
 # ── Pyramiding config (Option A) ──────────────────────────
 # Each position uses a fixed TP/SL (from barrier_model's TP_PCT/SL_PCT).
@@ -173,6 +174,20 @@ def run_bot(model, scaler, encoder, barrier_model=None, barrier_scaler=None, bar
     last_day     = datetime.now().day
     limit_notice_sent = False  # only send the "waiting" summary once per limit-reached streak
 
+    # ── Restore Stop Loss cooldown from SQLite history if within 1 hour ──
+    last_sl_time = get_last_sl_time(SYMBOL)
+    if last_sl_time is not None:
+        secs_since_sl = (now0 - last_sl_time).total_seconds()
+        if secs_since_sl < SL_COOLDOWN_MINUTES * 60:
+            mins_left = int((SL_COOLDOWN_MINUTES * 60 - secs_since_sl) // 60) + 1
+            print(f"[{SYMBOL}] Active Stop Loss cooldown restored: {mins_left}m remaining")
+            send_message(
+                f"⏸️ <b>[{SYMBOL}] Active SL Cooldown Restored</b>\n"
+                f"Stop Loss was hit recently. {mins_left} minute(s) remaining before new signal generation."
+            )
+        else:
+            last_sl_time = None
+
     while True:
         now = datetime.now()
 
@@ -244,6 +259,11 @@ def run_bot(model, scaler, encoder, barrier_model=None, barrier_scaler=None, bar
                     daily_pnl = close_position(pos, pos['stop_loss'], "SL Hit (Candle Low)", daily_pnl)
                     closed_positions.append(pos)
                     # Losses stay counted against the daily limit
+                    last_sl_time = now
+                    send_message(
+                        f"⏸️ <b>[{SYMBOL}] Stop Loss Cooldown Initiated</b>\n"
+                        f"SL was hit. Pausing new signal generation for {SL_COOLDOWN_MINUTES} minutes."
+                    )
 
             for pos in closed_positions:
                 open_positions.remove(pos)
@@ -253,9 +273,11 @@ def run_bot(model, scaler, encoder, barrier_model=None, barrier_scaler=None, bar
             # ── Pyramiding: open a new rung if price is closing in on an
             # existing (unpyramided) position's TP and the barrier model
             # still confirms bullish.
+            is_sl_cooldown = last_sl_time is not None and (now - last_sl_time).total_seconds() < SL_COOLDOWN_MINUTES * 60
             if (len(open_positions) < MAX_PYRAMID_POSITIONS
                     and daily_trades < MAX_TRADES_PER_DAY
-                    and barrier_model is not None):
+                    and barrier_model is not None
+                    and not is_sl_cooldown):
                 for pos in open_positions:
                     if pos['action'] != 'BUY' or pos.get('pyramided'):
                         continue
@@ -329,10 +351,23 @@ def run_bot(model, scaler, encoder, barrier_model=None, barrier_scaler=None, bar
             limit_notice_sent = False  # reset once we're back under the limit
 
         if daily_pnl <= -MAX_DAILY_LOSS:
-            notify_loss_limit()
+            notify_loss_limit(SYMBOL)
             print(f"[{SYMBOL}] [{now.strftime('%H:%M')}] Daily loss limit hit, stopping for today...")
             time.sleep(3600)
             continue
+
+        # ── Check Stop Loss cooldown (1 hour) ─────────────────
+        if last_sl_time is not None:
+            seconds_since_sl = (now - last_sl_time).total_seconds()
+            if seconds_since_sl < SL_COOLDOWN_MINUTES * 60:
+                mins_left = int((SL_COOLDOWN_MINUTES * 60 - seconds_since_sl) // 60) + 1
+                print(f"[{SYMBOL}] [{now.strftime('%H:%M')}] SL cooldown active ({mins_left}m remaining) — skipping signal generation")
+                time.sleep(60)
+                continue
+            else:
+                print(f"[{SYMBOL}] [{now.strftime('%H:%M')}] SL cooldown expired — resuming signal generation")
+                send_message(f"▶️ <b>[{SYMBOL}] Cooldown ended</b>\n1 hour elapsed since Stop Loss. Resuming signal generation.")
+                last_sl_time = None
 
         # ── Fetch live data and generate signal ───────────────
         try:

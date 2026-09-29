@@ -27,19 +27,19 @@ _MAX_EVENTS = 500  # rolling window of recent liquidation events per symbol
 
 
 def _normalize_symbol(symbol: str) -> str:
-    """Accepts 'ONE' or 'ONEUSDT' and returns the Binance futures symbol."""
+    """Accepts 'ETH' or 'ETHUSDT' and returns the Binance futures symbol."""
     symbol = symbol.upper()
     return symbol if symbol.endswith("USDT") else f"{symbol}USDT"
 
 
 class LiquidationTracker:
     """
-    Maintains a rolling window of real liquidation events for one symbol,
+    Maintains a rolling window of real liquidation events for ETH symbol,
     fed by Binance's public forceOrder websocket stream. Runs in a
     background thread and auto-reconnects with exponential backoff.
     """
 
-    def __init__(self, symbol="ONEUSDT"):
+    def __init__(self, symbol="ETHUSDT"):
         self.symbol = _normalize_symbol(symbol)
         self.events = deque(maxlen=_MAX_EVENTS)
         self.lock = threading.Lock()
@@ -204,7 +204,7 @@ def _get_tracker(symbol: str) -> LiquidationTracker:
         return _trackers[key]
 
 
-def get_liq_data(symbol='ONE', current_price=None):
+def get_liq_data(symbol='ETH', current_price=None):
     """
     Drop-in replacement for the old Coinglass-based get_liq_data().
     Returns (liq_analysis_dict_or_None, levels_list).

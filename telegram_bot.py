@@ -55,7 +55,7 @@ def notify_signal(signal, daily_trades):
         emoji = '🔴'
 
     msg = (
-        f"{emoji} <b>{signal['action']} Signal — ONE/USDT</b>\n\n"
+        f"{emoji} <b>{signal['action']} Signal — ETH/USDT</b>\n\n"
         f"💰 Entry:       <b>{signal['entry']}</b>\n"
         f"🎯 Take Profit: <b>{signal['take_profit']}</b>\n"
         f"🛑 Stop Loss:   <b>{signal['stop_loss']}</b>\n"
@@ -79,8 +79,8 @@ def notify_daily_limit():
     send_message("⛔ <b>Max trades reached for today (8/8)</b>")
 
 
-def notify_loss_limit():
-    send_message("🚨 <b>Daily loss limit hit (-1.5%), stopping for today</b>")
+def notify_loss_limit(symbol: str):
+    send_message(f"🚨 <b>Daily loss limit hit (-1.5%), stopping for today for {symbol}</b>")
 
 
 def notify_error(error: str):

@@ -184,3 +184,21 @@ def get_daily_summary():
         overall_trades += trades
 
     return summary, overall_pnl, overall_trades
+
+
+def get_last_sl_time(symbol: str):
+    """Returns datetime of the most recent Stop Loss hit for this symbol, or None."""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT closed_at FROM trade_history
+            WHERE symbol = ? AND close_reason LIKE 'SL Hit%'
+            ORDER BY id DESC LIMIT 1
+        """, (symbol,))
+        row = cursor.fetchone()
+        if row and row["closed_at"]:
+            try:
+                return datetime.fromisoformat(row["closed_at"])
+            except Exception:
+                return None
+    return None
