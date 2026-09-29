@@ -20,7 +20,7 @@ from telegram_bot import (
     notify_loss_limit, notify_error, notify_start, notify_stop,
     send_message
 )
-from db import init_db, save_bot_state, load_bot_state, record_closed_trade, get_last_sl_time
+from db import get_last_tp_time, init_db, save_bot_state, load_bot_state, record_closed_trade, get_last_sl_time
 
 # ── Symbol: set via env var so the SAME image runs any coin ──
 # docker run -e SYMBOL=SOL/USDT ...  (see docker-compose.yml)
@@ -35,6 +35,7 @@ TRAIN_CANDLES      = 2880
 LIVE_CANDLES       = 1000
 MAX_MODEL_AGE_HRS  = 12
 SL_COOLDOWN_MINUTES = 60     # Pause signal generation for 1 hour after Stop Loss hit
+TP_COOLDOWN_MINUTES = 5      # Pause fresh signal generation for 5 minutes after Take Profit hit
 
 # ── Pyramiding config (Option A) ──────────────────────────
 # Each position uses a fixed TP/SL (from barrier_model's TP_PCT/SL_PCT).
@@ -144,26 +145,22 @@ def close_position(pos, current_price, reason, daily_pnl):
 
 
 def run_bot(model, scaler, encoder, barrier_model=None, barrier_scaler=None, barrier_encoder=None):
-    # ── Restore state from disk if the process was restarted mid-trade ──
     saved_positions, saved_trades, saved_pnl, saved_day = load_bot_state(SYMBOL)
     now0 = datetime.now()
     if saved_positions or saved_day == now0.day:
         open_positions = saved_positions or []
         daily_trades   = saved_trades if saved_day == now0.day else 0
         daily_pnl      = saved_pnl if saved_day == now0.day else 0.0
-        # Normalize in case these were saved by an older schema
         if open_positions:
             try:
                 _price_for_decimals = fetch_current_price(SYMBOL)
                 _decimals = get_decimal_places(_price_for_decimals)
             except Exception:
-                _decimals = 4  # reasonable fallback if the API call fails here
+                _decimals = 4
             open_positions = [normalize_position(p, _decimals) for p in open_positions]
-        print(f"[{SYMBOL}] Restored {len(open_positions)} open position(s) "
-              f"and today's counters from SQLite")
+        print(f"[{SYMBOL}] Restored {len(open_positions)} open position(s) and today's counters from SQLite")
         if open_positions:
-            send_message(f"🔄 <b>[{SYMBOL}] Restarted — restored "
-                          f"{len(open_positions)} open position(s) from SQLite</b>")
+            send_message(f"🔄 <b>[{SYMBOL}] Restarted — restored {len(open_positions)} open position(s) from DB</b>")
             save_bot_state(SYMBOL, open_positions, daily_trades, daily_pnl, now0.day)
     else:
         open_positions = []
@@ -172,26 +169,30 @@ def run_bot(model, scaler, encoder, barrier_model=None, barrier_scaler=None, bar
 
     last_retrain = datetime.now()
     last_day     = datetime.now().day
-    limit_notice_sent = False  # only send the "waiting" summary once per limit-reached streak
+    limit_notice_sent = False
 
-    # ── Restore Stop Loss cooldown from SQLite history if within 1 hour ──
     last_sl_time = get_last_sl_time(SYMBOL)
     if last_sl_time is not None:
         secs_since_sl = (now0 - last_sl_time).total_seconds()
         if secs_since_sl < SL_COOLDOWN_MINUTES * 60:
             mins_left = int((SL_COOLDOWN_MINUTES * 60 - secs_since_sl) // 60) + 1
             print(f"[{SYMBOL}] Active Stop Loss cooldown restored: {mins_left}m remaining")
-            send_message(
-                f"⏸️ <b>[{SYMBOL}] Active SL Cooldown Restored</b>\n"
-                f"Stop Loss was hit recently. {mins_left} minute(s) remaining before new signal generation."
-            )
         else:
             last_sl_time = None
+
+    last_tp_time = get_last_tp_time(SYMBOL)
+    if last_tp_time is not None:
+        secs_since_tp = (now0 - last_tp_time).total_seconds()
+        if secs_since_tp < TP_COOLDOWN_MINUTES * 60:
+            mins_left = int((TP_COOLDOWN_MINUTES * 60 - secs_since_tp) // 60) + 1
+            print(f"[{SYMBOL}] Active TP cooldown restored: {mins_left}m remaining")
+        else:
+            last_tp_time = None
 
     while True:
         now = datetime.now()
 
-        # ── Reset daily counters at midnight ─────────────────
+        # Reset daily counters at midnight
         if now.day != last_day:
             daily_trades   = 0
             daily_pnl      = 0.0
@@ -202,7 +203,7 @@ def run_bot(model, scaler, encoder, barrier_model=None, barrier_scaler=None, bar
             send_message(f"🔄 <b>[{SYMBOL}] Daily counters reset</b>{holding_msg}")
             save_bot_state(SYMBOL, open_positions, daily_trades, daily_pnl, last_day)
 
-        # ── Retrain every 1 hour ──────────────────────────────
+        # Retrain every 1 hour
         minutes_since_retrain = (now - last_retrain).seconds / 60
         if minutes_since_retrain >= 60:
             print(f"[{SYMBOL}] [{now.strftime('%H:%M')}] Retraining model...")
@@ -212,16 +213,11 @@ def run_bot(model, scaler, encoder, barrier_model=None, barrier_scaler=None, bar
                 df_test  = fetch_ohlcv(SYMBOL, '5m', limit=200)
                 df_test  = add_features(df_test)
                 X_scaled = scaler.transform(df_test[FEATURES])
-                # probas   = model.predict_proba(X_scaled)
-                # avg_conf = probas.max(axis=1).mean()
-                # max_conf = probas.max(axis=1).max()
-                # notify_retrain(TRAIN_CANDLES, avg_conf, max_conf)
                 print(f"[{SYMBOL}] [{now.strftime('%H:%M')}] Model retrained and saved")
             except Exception as e:
                 notify_error(f"[{SYMBOL}] {e}")
                 print(f"[{SYMBOL}] [{now.strftime('%H:%M')}] Retrain failed: {e}")
 
-            # ── Retrain barrier (TP magnitude) model too ──────
             try:
                 print(f"[{SYMBOL}] [{now.strftime('%H:%M')}] Retraining barrier model...")
                 barrier_model, barrier_scaler, barrier_encoder = retrain_barrier_and_save()
@@ -230,9 +226,8 @@ def run_bot(model, scaler, encoder, barrier_model=None, barrier_scaler=None, bar
                 notify_error(f"[{SYMBOL}] Barrier retrain failed: {e}")
                 print(f"[{SYMBOL}] [{now.strftime('%H:%M')}] Barrier retrain failed: {e}")
 
-        # ── Check open positions: using Candle High/Low to catch wicks ──
+        # Check open positions using Candle High/Low
         try:
-            # Fetch recent 5m candle data to capture the latest High/Low wicks
             df_recent = fetch_ohlcv(SYMBOL, '5m', limit=2)
             latest_candle = df_recent.iloc[-1]
             candle_high   = float(latest_candle['high'])
@@ -243,24 +238,19 @@ def run_bot(model, scaler, encoder, barrier_model=None, barrier_scaler=None, bar
             closed_positions = []
             for pos in open_positions:
                 if pos['action'] != 'BUY':
-                    continue  # spot/long-only -- shouldn't happen, but be safe
+                    continue
 
-                # 1. Check if the candle high wick reached/passed Take Profit
                 if candle_high >= pos['take_profit']:
-                    # Close at exact TP target price to accurately simulate a limit order fill
                     daily_pnl = close_position(pos, pos['take_profit'], "TP Hit (Candle High)", daily_pnl)
                     closed_positions.append(pos)
-                    # A profitable close frees up a trade slot
-                    daily_trades = max(0, daily_trades - 1)
+                    last_tp_time = now
+                    print(f"⏸️ [{SYMBOL}] TP Cooldown Initiated ({TP_COOLDOWN_MINUTES} minutes)")
 
-                # 2. Check if the candle low wick reached/passed Stop Loss
                 elif candle_low <= pos['stop_loss']:
-                    # Close at exact SL target price
                     daily_pnl = close_position(pos, pos['stop_loss'], "SL Hit (Candle Low)", daily_pnl)
                     closed_positions.append(pos)
-                    # Losses stay counted against the daily limit
                     last_sl_time = now
-                    send_message(
+                    print(
                         f"⏸️ <b>[{SYMBOL}] Stop Loss Cooldown Initiated</b>\n"
                         f"SL was hit. Pausing new signal generation for {SL_COOLDOWN_MINUTES} minutes."
                     )
@@ -270,9 +260,7 @@ def run_bot(model, scaler, encoder, barrier_model=None, barrier_scaler=None, bar
             if closed_positions:
                 save_bot_state(SYMBOL, open_positions, daily_trades, daily_pnl, last_day)
 
-            # ── Pyramiding: open a new rung if price is closing in on an
-            # existing (unpyramided) position's TP and the barrier model
-            # still confirms bullish.
+            # Pyramiding Check
             is_sl_cooldown = last_sl_time is not None and (now - last_sl_time).total_seconds() < SL_COOLDOWN_MINUTES * 60
             if (len(open_positions) < MAX_PYRAMID_POSITIONS
                     and daily_trades < MAX_TRADES_PER_DAY
@@ -288,20 +276,20 @@ def run_bot(model, scaler, encoder, barrier_model=None, barrier_scaler=None, bar
                     try:
                         df_pyr = fetch_ohlcv(SYMBOL, '5m', limit=LIVE_CANDLES)
                         df_pyr = add_features(df_pyr)
-                        barrier_probs = predict_barrier_probabilities(
+                        pyr_barrier_probs = predict_barrier_probabilities(
                             barrier_model, barrier_scaler, barrier_encoder, df_pyr
                         )
-                        still_bullish, reason = should_enter(barrier_probs)
+                        still_bullish, reason = should_enter(pyr_barrier_probs)
                     except Exception as e:
                         print(f"  ⚠️  Pyramid barrier check failed: {e}")
                         still_bullish = False
                         reason = "barrier check failed"
 
-                    pos['pyramided'] = True  # only ever try once per rung, hit or miss
+                    pos['pyramided'] = True
 
                     if still_bullish:
                         new_entry = current_price
-                        rung_tp_pct = barrier_probs.get('recommended_tp', TP_PCT)
+                        rung_tp_pct = pyr_barrier_probs.get('recommended_tp', TP_PCT)
                         new_tp    = round(new_entry * (1 + rung_tp_pct), decimals)
                         new_sl    = round(new_entry * (1 - SL_PCT), decimals)
                         open_positions.append({
@@ -321,25 +309,22 @@ def run_bot(model, scaler, encoder, barrier_model=None, barrier_scaler=None, bar
                             f"📊 {reason}"
                         )
                         save_bot_state(SYMBOL, open_positions, daily_trades, daily_pnl, last_day)
-                    break  # only evaluate one candidate rung per loop tick
+                    break
 
         except Exception as e:
             print(f"[{SYMBOL}] [{now.strftime('%H:%M')}] Position check error: {e}")
 
-        # ── Skip if limits reached ────────────────────────────
+        # Check Daily Limits
         if daily_trades >= MAX_TRADES_PER_DAY:
             open_count = len(open_positions)
-            print(f"[{SYMBOL}] [{now.strftime('%H:%M')}] Max trades reached | "
-                  f"Open positions: {open_count} | Price: {current_price}")
+            print(f"[{SYMBOL}] [{now.strftime('%H:%M')}] Max trades reached | Open positions: {open_count}")
             if open_count > 0 and not limit_notice_sent:
                 pos_summary = "\n".join([
-                    f"  🟢 BUY | Entry: {p['entry']} | "
-                    f"TP: {p['take_profit']} | SL: {p['stop_loss']}"
+                    f"  🟢 BUY | Entry: {p['entry']} | TP: {p['take_profit']} | SL: {p['stop_loss']}"
                     for p in open_positions
                 ])
                 send_message(
-                    f"⏳ <b>[{SYMBOL}] Daily trade limit reached — "
-                    f"{open_count} position(s) still open, will notify on exit</b>\n\n"
+                    f"⏳ <b>[{SYMBOL}] Daily trade limit reached — {open_count} position(s) still open</b>\n\n"
                     f"{pos_summary}\n\n"
                     f"💵 Current price: <b>{current_price}</b>\n"
                     f"📊 Daily PnL: <b>{daily_pnl:.2f}%</b>"
@@ -348,7 +333,7 @@ def run_bot(model, scaler, encoder, barrier_model=None, barrier_scaler=None, bar
             time.sleep(60)
             continue
         else:
-            limit_notice_sent = False  # reset once we're back under the limit
+            limit_notice_sent = False
 
         if daily_pnl <= -MAX_DAILY_LOSS:
             notify_loss_limit(SYMBOL)
@@ -356,20 +341,29 @@ def run_bot(model, scaler, encoder, barrier_model=None, barrier_scaler=None, bar
             time.sleep(3600)
             continue
 
-        # ── Check Stop Loss cooldown (1 hour) ─────────────────
+        # Check Stop Loss Cooldown
         if last_sl_time is not None:
             seconds_since_sl = (now - last_sl_time).total_seconds()
             if seconds_since_sl < SL_COOLDOWN_MINUTES * 60:
                 mins_left = int((SL_COOLDOWN_MINUTES * 60 - seconds_since_sl) // 60) + 1
-                print(f"[{SYMBOL}] [{now.strftime('%H:%M')}] SL cooldown active ({mins_left}m remaining) — skipping signal generation")
+                print(f"[{SYMBOL}] [{now.strftime('%H:%M')}] SL cooldown active ({mins_left}m remaining)")
                 time.sleep(60)
                 continue
             else:
-                print(f"[{SYMBOL}] [{now.strftime('%H:%M')}] SL cooldown expired — resuming signal generation")
-                send_message(f"▶️ <b>[{SYMBOL}] Cooldown ended</b>\n1 hour elapsed since Stop Loss. Resuming signal generation.")
                 last_sl_time = None
 
-        # ── Fetch live data and generate signal ───────────────
+        # Check Take Profit Cooldown
+        if last_tp_time is not None:
+            seconds_since_tp = (now - last_tp_time).total_seconds()
+            if seconds_since_tp < TP_COOLDOWN_MINUTES * 60:
+                mins_left = int((TP_COOLDOWN_MINUTES * 60 - seconds_since_tp) // 60) + 1
+                print(f"[{SYMBOL}] [{now.strftime('%H:%M')}] TP cooldown active ({mins_left}m remaining)")
+                time.sleep(60)
+                continue
+            else:
+                last_tp_time = None
+
+        # Fresh Signal Processing
         try:
             df     = fetch_ohlcv(SYMBOL, '5m', limit=LIVE_CANDLES)
             df     = add_features(df)
@@ -378,27 +372,21 @@ def run_bot(model, scaler, encoder, barrier_model=None, barrier_scaler=None, bar
             coin        = SYMBOL.split('/')[0]
             liq, levels = get_liq_data(coin, current_price)
 
-            # Spot trading: no shorting, so SELL is never a new entry.
             if signal['action'] == 'SELL':
-                print(f"  ℹ️  SELL prediction ignored — spot trading is long-only")
                 signal['action'] = None
 
             if signal['action'] and liq:
                 if signal['action'] == 'BUY' and liq['bias'] == 'BEARISH':
-                    print(f"  ⚠️  BUY blocked — liquidation bias is BEARISH")
                     signal['action'] = None
                 if liq['liq_spike']:
-                    print(f"  ⚠️  Signal blocked — liquidation spike detected")
                     signal['action'] = None
 
+            barrier_probs = {}  # Initialized safely to prevent UnboundLocalError
             if signal['action'] == 'BUY':
                 decimals = get_decimal_places(current_price)
                 enter    = False
 
                 if len(open_positions) > 0:
-                    print(f"  ℹ️  Skipping fresh signal entry — "
-                          f"{len(open_positions)} position(s) already open "
-                          f"(new entries come from pyramiding only)")
                     signal['action'] = None
                 elif barrier_model is not None:
                     try:
@@ -406,22 +394,11 @@ def run_bot(model, scaler, encoder, barrier_model=None, barrier_scaler=None, bar
                             barrier_model, barrier_scaler, barrier_encoder, df
                         )
                         enter, reason = should_enter(barrier_probs)
-                        rec_tp = barrier_probs.get('recommended_tp', TP_PCT)
-                        print(f"  📊 Barrier probs: "
-                              f"SL={barrier_probs['p_sl_first']:.0%} "
-                              f"FibProfit={barrier_probs['p_tp_first']:.0%} "
-                              f"(1%:{barrier_probs.get('p_fib_1', 0):.0%}, "
-                              f"2%:{barrier_probs.get('p_fib_2', 0):.0%}, "
-                              f"3%:{barrier_probs.get('p_fib_3', 0):.0%}, "
-                              f"5%:{barrier_probs.get('p_fib_5', 0):.0%}, "
-                              f"8%:{barrier_probs.get('p_fib_8', 0):.0%}, "
-                              f"13%:{barrier_probs.get('p_fib_13', 0):.0%}) "
-                              f"timeout={barrier_probs['p_timeout']:.0%} — {reason}")
                     except Exception as e:
-                        print(f"  ⚠️  Barrier prediction failed: {e}")
+                        print(f"  ⚠️ Barrier prediction failed: {e}")
                         enter = False
                 else:
-                    print("  ⚠️  No barrier model loaded — skipping trade")
+                    print("  ⚠️ No barrier model loaded — skipping trade")
 
                 if not enter:
                     signal['action'] = None
@@ -439,8 +416,6 @@ def run_bot(model, scaler, encoder, barrier_model=None, barrier_scaler=None, bar
             liq_info = f"Liq: {liq['bias']} ({liq['liq_ratio']:.0%})" if liq else "Liq: N/A"
             print(f"[{SYMBOL}] [{now.strftime('%H:%M')}] "
                   f"Signal: {signal['action'] or 'NONE':4} | "
-                  f"Pred: {signal['pred_label']:+d} | "
-                  f"Confidence: {signal['confidence']:.2f} | "
                   f"Price: {current_price} | "
                   f"{liq_info} | "
                   f"Trades: {daily_trades}/{MAX_TRADES_PER_DAY}")
@@ -470,7 +445,6 @@ def run_bot(model, scaler, encoder, barrier_model=None, barrier_scaler=None, bar
             print(f"[{SYMBOL}] [{now.strftime('%H:%M')}] Error: {e}")
 
         time.sleep(60)
-
 
 if __name__ == "__main__":
     print("=" * 50)

@@ -186,15 +186,15 @@ def get_daily_summary():
     return summary, overall_pnl, overall_trades
 
 
-def get_last_sl_time(symbol: str):
-    """Returns datetime of the most recent Stop Loss hit for this symbol, or None."""
+def get_last_close_time(symbol: str, reason_prefix: str):
+    """Returns datetime of the most recent close whose reason starts with prefix, or None."""
     with get_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("""
             SELECT closed_at FROM trade_history
-            WHERE symbol = ? AND close_reason LIKE 'SL Hit%'
+            WHERE symbol = ? AND close_reason LIKE ?
             ORDER BY id DESC LIMIT 1
-        """, (symbol,))
+        """, (symbol, f"{reason_prefix}%"))
         row = cursor.fetchone()
         if row and row["closed_at"]:
             try:
@@ -202,3 +202,11 @@ def get_last_sl_time(symbol: str):
             except Exception:
                 return None
     return None
+
+
+def get_last_sl_time(symbol: str):
+    return get_last_close_time(symbol, "SL Hit")
+
+
+def get_last_tp_time(symbol: str):
+    return get_last_close_time(symbol, "TP Hit")

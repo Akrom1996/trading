@@ -51,3 +51,29 @@ services:
     volumes:
       - ./data:/app/data
     restart: always
+    
+  bot-qnt:
+    build: .
+    container_name: bot-qnt
+    environment:
+      - SYMBOL=QNT/USDT
+      - DB_PATH=/app/data/bot_data.db
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
+    mem_limit: 512m
+
+  bot-apt:
+    build: .
+    container_name: bot-apt
+    environment:
+      - SYMBOL=APT/USDT
+      - DB_PATH=/app/data/bot_data.db
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
+    mem_limit: 512m
