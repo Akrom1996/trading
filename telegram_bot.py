@@ -3,6 +3,7 @@ import os
 
 TELEGRAM_TOKEN   = os.getenv('TELEGRAM_TOKEN', '')   # from BotFather
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')      # from userinfobot
+TELEGRAM_ERROR_CHAT_ID = os.getenv('TELEGRAM_ERROR_CHAT_ID')      # from error bot
 
 def notify_signal_with_liq(signal, daily_trades, liq, level_text='',symbol=''):
     emoji = '🟢' if signal['action'] == 'BUY' else '🔴'
@@ -35,11 +36,11 @@ def notify_signal_with_liq(signal, daily_trades, liq, level_text='',symbol=''):
     )
     send_message(msg)
 
-def send_message(text: str):
+def send_message(text: str, chat_id=TELEGRAM_CHAT_ID):
     try:
         url  = f'https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage'
         data = {
-            'chat_id':    TELEGRAM_CHAT_ID,
+            'chat_id':    chat_id,
             'text':       text,
             'parse_mode': 'HTML'
         }
@@ -72,24 +73,24 @@ def notify_retrain(candles, avg_conf, max_conf):
         f"📈 Avg Conf:    <b>{avg_conf:.0%}</b>\n"
         f"🔝 Max Conf:    <b>{max_conf:.0%}</b>"
     )
-    send_message(msg)
+    send_message(msg, TELEGRAM_ERROR_CHAT_ID)
 
 
 def notify_daily_limit():
-    send_message("⛔ <b>Max trades reached for today (8/8)</b>")
+    send_message("⛔ <b>Max trades reached for today (8/8)</b>", TELEGRAM_ERROR_CHAT_ID)
 
 
 def notify_loss_limit(symbol: str):
-    send_message(f"🚨 <b>Daily loss limit hit (-1.5%), stopping for today for {symbol}</b>")
+    send_message(f"🚨 <b>Daily loss limit hit (-6%), stopping for today for {symbol}</b>", TELEGRAM_ERROR_CHAT_ID)
 
 
 def notify_error(error: str):
-    send_message(f"❌ <b>Bot Error</b>\n<code>{error}</code>")
+    send_message(f"❌ <b>Bot Error</b>\n<code>{error}</code>", TELEGRAM_ERROR_CHAT_ID)
 
 
 def notify_start(symbol: str):
-    send_message(f"✅ <b>{symbol} Trading Bot Started</b>")
+    send_message(f"✅ <b>{symbol} Trading Bot Started</b>", TELEGRAM_ERROR_CHAT_ID)
 
 
 def notify_stop():
-    send_message("🛑 <b>Bot stopped by user</b>")
+    send_message("🛑 <b>Bot stopped by user</b>", TELEGRAM_ERROR_CHAT_ID)

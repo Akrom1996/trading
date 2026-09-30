@@ -31,7 +31,7 @@ MAX_RISK_PER_TRADE = 0.02
 MAX_DAILY_LOSS     = 6      # percentage points -- daily_pnl accumulates as e.g. -1.5
                              # for a -1.5% close, not as a 0.015 fraction, so this
                              # must be in the same units or it trips on the first SL
-MAX_TRADES_PER_DAY = 10
+MAX_TRADES_PER_DAY = 8
 TRAIN_CANDLES      = 2880
 LIVE_CANDLES       = 1000
 MAX_MODEL_AGE_HRS  = 12
@@ -55,7 +55,7 @@ QUOTE_AMOUNT_PER_TRADE = float(os.getenv('QUOTE_AMOUNT_PER_TRADE', '20'))
 # signal price instead of buying at market. Catches a brief post-signal
 # dip for a better entry, at the cost of possibly missing the trade
 # entirely if price never comes back down to the limit price.
-ENTRY_OFFSET_PCT = float(os.getenv('ENTRY_OFFSET_PCT', '0.004'))
+ENTRY_OFFSET_PCT = float(os.getenv('ENTRY_OFFSET_PCT', '0.003'))
 
 
 def get_decimal_places(price: float) -> int:
