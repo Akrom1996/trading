@@ -4,6 +4,7 @@ import os
 TELEGRAM_TOKEN   = os.getenv('TELEGRAM_TOKEN', '')   # from BotFather
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')      # from userinfobot
 TELEGRAM_ERROR_CHAT_ID = os.getenv('TELEGRAM_ERROR_CHAT_ID')      # from error bot
+MAX_TRADES_PER_DAY = os.getenv('MAX_TRADES_PER_DAY', '20')
 
 def notify_signal_with_liq(signal, daily_trades, liq, level_text='',symbol=''):
     emoji = '🟢' if signal['action'] == 'BUY' else '🔴'
@@ -30,7 +31,7 @@ def notify_signal_with_liq(signal, daily_trades, liq, level_text='',symbol=''):
         f"🎯 Take Profit: <b>{signal['take_profit']}</b>{fib_str}\n"
         f"🛑 Stop Loss:   <b>{signal['stop_loss']}</b>\n"
         f"📊 Confidence:  <b>{conf_str}</b>\n"
-        f"🔢 Trade:       <b>{daily_trades}/8</b>"
+        f"🔢 Trade:       <b>{daily_trades}/{MAX_TRADES_PER_DAY}</b>"
         f"{liq_section}"
         f"{level_text}"
     )
@@ -61,7 +62,7 @@ def notify_signal(signal, daily_trades):
         f"🎯 Take Profit: <b>{signal['take_profit']}</b>\n"
         f"🛑 Stop Loss:   <b>{signal['stop_loss']}</b>\n"
         f"📊 Confidence:  <b>{signal['confidence']:.0%}</b>\n"
-        f"🔢 Trade:       <b>{daily_trades}/8</b>"
+        f"🔢 Trade:       <b>{daily_trades}/{MAX_TRADES_PER_DAY}</b>"
     )
     send_message(msg)
 
@@ -77,7 +78,7 @@ def notify_retrain(candles, avg_conf, max_conf):
 
 
 def notify_daily_limit():
-    send_message("⛔ <b>Max trades reached for today (8/8)</b>", TELEGRAM_ERROR_CHAT_ID)
+    send_message("⛔ <b>Max trades reached for today ({MAX_TRADES_PER_DAY}/{MAX_TRADES_PER_DAY})</b>", TELEGRAM_ERROR_CHAT_ID)
 
 
 def notify_loss_limit(symbol: str):

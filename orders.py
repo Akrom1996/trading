@@ -1,29 +1,32 @@
 """
 Binance order execution via ccxt.
 
-SAFETY MODEL — three layers, check them in this order before ever
-pointing this at real funds:
-
-  1. DRY_RUN=true (default)   -- logs what WOULD be ordered, places
-                                  nothing. Use this to sanity-check
-                                  sizing/timing against live signals
-                                  before any money is at risk.
-  2. BINANCE_TESTNET=true     -- talks to Binance's Spot Testnet
-                                  (fake funds, same API surface). Use
-                                  this once DRY_RUN output looks right,
-                                  to test the actual order-placement
-                                  path without risking real capital.
-  3. Real API key, TESTNET=false, DRY_RUN=false
-                                -- live trading. Only flip this after
-                                  1 and 2 have run clean for a while.
+SAFETY MODEL — three layers:
+  1. DRY_RUN=true (default)   -- logs what WOULD be ordered, places nothing.
+  2. BINANCE_TESTNET=true     -- talks to Binance's Spot Testnet (fake funds).
+  3. Real API key, TESTNET=false, DRY_RUN=false -- live trading.
 
 Requires in .env:
     BINANCE_API_KEY
     BINANCE_API_SECRET
-    BINANCE_TESTNET=true|false   (default: true -- safest default)
-    DRY_RUN=true|false           (default: true -- safest default)
+    BINANCE_TESTNET=true|false   (default: true)
+    DRY_RUN=true|false          (default: true)
 
 Install: pip install ccxt
+
+NON-BLOCKING DESIGN NOTE:
+This module does NOT poll-and-wait for a limit order to fill. A limit
+order placed below market (per ENTRY_OFFSET_PCT) may take minutes or
+may never fill -- blocking the bot's main loop on that would freeze
+position checks, retrains, and every other symbol sharing the process
+for as long as the wait takes, which could be indefinite.
+
+Instead: place_limit_buy() returns immediately after placing the order.
+check_order_status() is a single, non-blocking check of that order's
+current state -- call it once per main loop tick (same ~60s cadence as
+everything else in main.py), and place the OCO sell only once you see
+'closed'. See main.py's pending-order handling in the position-check
+block for how this is wired together.
 """
 
 import os
@@ -31,19 +34,18 @@ import ccxt
 
 BINANCE_API_KEY    = os.getenv('BINANCE_API_KEY')
 BINANCE_API_SECRET = os.getenv('BINANCE_API_SECRET')
-BINANCE_TESTNET     = os.getenv('BINANCE_TESTNET', 'true').lower() == 'true'
-DRY_RUN              = os.getenv('DRY_RUN', 'true').lower() == 'true'
+BINANCE_TESTNET    = os.getenv('BINANCE_TESTNET', 'true').lower() == 'true'
+DRY_RUN            = os.getenv('DRY_RUN', 'true').lower() == 'true'
 
 _exchange = None
-_markets_loaded = False
 
 
 def _get_exchange():
-    global _exchange, _markets_loaded
+    global _exchange
     if _exchange is not None:
         return _exchange
 
-    if not BINANCE_API_KEY or not BINANCE_API_SECRET:
+    if not DRY_RUN and (not BINANCE_API_KEY or not BINANCE_API_SECRET):
         raise RuntimeError(
             "BINANCE_API_KEY / BINANCE_API_SECRET not set -- cannot place "
             "real orders. Set DRY_RUN=true if you just want to log intended "
@@ -51,193 +53,232 @@ def _get_exchange():
         )
 
     _exchange = ccxt.binance({
-        'apiKey': BINANCE_API_KEY,
-        'secret': BINANCE_API_SECRET,
+        'apiKey': BINANCE_API_KEY or '',
+        'secret': BINANCE_API_SECRET or '',
         'enableRateLimit': True,
         'options': {'defaultType': 'spot'},
     })
+
     if BINANCE_TESTNET:
         _exchange.set_sandbox_mode(True)
         print("[orders] ⚠️  Running against Binance SPOT TESTNET (fake funds)")
-    else:
+    elif not DRY_RUN:
         print("[orders] 🔴 Running against Binance LIVE account — real funds")
+
+    try:
+        _exchange.load_markets()
+    except Exception as e:
+        if not DRY_RUN:
+            raise RuntimeError(f"Failed to load Binance markets: {e}")
 
     return _exchange
 
 
-def _check_min_notional(symbol: str, quote_amount: float):
-    """
-    Binance rejects orders below a symbol-specific minimum notional
-    value (varies per pair, commonly ~$5-10 but check per symbol).
-    Fail loudly and BEFORE sending the order, rather than finding out
-    from a confusing exchange error mid-trade.
-    """
-    if DRY_RUN:
-        return  # nothing to validate against a live orderbook in dry-run
-    exchange = _get_exchange()
-    global _markets_loaded
-    if not _markets_loaded:
-        exchange.load_markets()
-        _markets_loaded = True
-    market = exchange.market(symbol)
-    min_notional = None
-    # ccxt normalizes this differently across versions/exchanges --
-    # check the common locations.
-    limits = market.get('limits', {})
-    if 'cost' in limits and limits['cost'].get('min') is not None:
-        min_notional = limits['cost']['min']
-    if min_notional and quote_amount < min_notional:
-        raise ValueError(
-            f"QUOTE_AMOUNT_PER_TRADE={quote_amount} is below {symbol}'s "
-            f"minimum order value (${min_notional}) -- order would be "
-            f"rejected by Binance. Raise QUOTE_AMOUNT_PER_TRADE."
-        )
-
-
 def get_available_balance(asset: str) -> float:
-    """e.g. get_available_balance('USDT') -> 500.0"""
+    """Returns available free balance for asset (e.g., 'USDT')."""
     if DRY_RUN:
-        return float('inf')  # dry run never blocks on balance
+        return 10000.0  # Simulated balance
     exchange = _get_exchange()
     balance = exchange.fetch_balance()
-    return balance.get(asset, {}).get('free', 0.0)
+    return float(balance.get(asset, {}).get('free', 0.0))
 
 
-def place_limit_buy(symbol: str, limit_price: float, quote_amount: float,
-                     take_profit: float = None, stop_loss: float = None):
+def place_limit_buy(symbol: str, limit_price: float, quote_amount: float) -> dict:
     """
-    Places a LIMIT buy at `limit_price` (intentionally below current
-    market, per an entry offset -- see ENTRY_OFFSET_PCT in main.py)
-    rather than buying immediately at market. Used when a coin's price
-    tends to dip briefly after a BUY signal before the real move starts
-    -- this tries to catch that dip instead of paying the pre-dip price.
-
-    `take_profit`/`stop_loss` are NOT sent to Binance -- same as
-    place_market_buy, they're accepted purely so the full trade plan
-    (entry, TP, SL, size) is visible together in the log line.
-
-    NOTE: unlike a market order, this does NOT guarantee an immediate
-    fill. If price never comes back down to limit_price, the order
-    sits open (or, if never filled by the time you check, effectively
-    misses the trade). Returns immediately after placing -- filled_amount
-    will be 0 if the order hasn't filled yet at the time of this call.
-    Callers should treat a non-full fill as "position not fully open
-    yet" rather than assuming the whole size is on immediately.
+    Places a LIMIT buy order and returns IMMEDIATELY -- does not wait
+    for it to fill. Check fill status later with check_order_status().
     """
-    base_amount_estimate = round(quote_amount / limit_price, 6)
-    plan = f"TP={take_profit} SL={stop_loss} size={quote_amount} USDT"
+    exchange = _get_exchange()
+
+    formatted_price = float(exchange.price_to_precision(symbol, limit_price)) if not DRY_RUN else limit_price
+    raw_amount = quote_amount / formatted_price
+    formatted_amount = float(exchange.amount_to_precision(symbol, raw_amount)) if not DRY_RUN else round(raw_amount, 6)
 
     if DRY_RUN:
-        print(f"[orders] 🧪 DRY_RUN limit buy: {base_amount_estimate} {symbol.split('/')[0]} "
-              f"@ {limit_price} | {plan} (no real order placed)")
+        print(f"[orders] 🧪 DRY_RUN limit buy: {formatted_amount} {symbol.split('/')[0]} @ {formatted_price} (~{quote_amount:.2f} USDT)")
         return {
-            'id': 'dry-run', 'symbol': symbol, 'limit_price': limit_price,
-            'filled_amount': base_amount_estimate, 'avg_price': limit_price,
-            'dry_run': True, 'status': 'closed',
-            'take_profit': take_profit, 'stop_loss': stop_loss,
+            'id': 'dry-run-limit-buy',
+            'symbol': symbol,
+            'limit_price': formatted_price,
+            'filled_amount': formatted_amount,
+            'avg_price': formatted_price,
+            'dry_run': True,
+            'status': 'closed',  # dry run simulates an instant fill
         }
 
-    exchange = _get_exchange()
     order = exchange.create_order(
         symbol=symbol, type='limit', side='buy',
-        amount=base_amount_estimate, price=limit_price,
+        amount=formatted_amount, price=formatted_price,
     )
     filled = float(order.get('filled', 0) or 0)
-    print(f"[orders] 📝 LIVE limit buy placed: {base_amount_estimate} {symbol.split('/')[0]} "
-          f"@ {limit_price} (order id {order.get('id')}, filled so far: {filled}, "
-          f"status: {order.get('status')}) | plan: {plan}")
+    print(f"[orders] 📝 LIVE limit buy placed: {formatted_amount} {symbol.split('/')[0]} "
+          f"@ {formatted_price} (id: {order.get('id')}, status: {order.get('status')})")
     return {
-        'id': order.get('id'), 'symbol': symbol, 'limit_price': limit_price,
-        'filled_amount': filled, 'avg_price': limit_price,
-        'dry_run': False, 'status': order.get('status'),
-        'take_profit': take_profit, 'stop_loss': stop_loss,
+        'id': order.get('id'),
+        'symbol': symbol,
+        'limit_price': formatted_price,
+        'filled_amount': filled,
+        'avg_price': formatted_price,
+        'dry_run': False,
+        'status': order.get('status'),
     }
 
 
-def place_market_buy(symbol: str, quote_amount: float, expected_price: float = None,
-                      take_profit: float = None, stop_loss: float = None):
+def check_order_status(symbol: str, order_id: str) -> dict:
     """
-    Buys `quote_amount` worth of `symbol`'s quote currency (e.g.
-    quote_amount=50 on 'ZEC/USDT' spends 50 USDT buying ZEC at market).
+    ONE non-blocking check of an order's current state. Call this once
+    per main loop tick (not in a loop within this function) for any
+    order you're waiting on -- never poll-and-sleep here.
 
-    `expected_price`, `take_profit`, `stop_loss` are NOT sent to Binance
-    (a market order has no price/TP/SL fields) -- they're accepted here
-    purely so the caller's full trade plan is visible in one place: the
-    order log line, the Telegram message, and the returned dict all show
-    what was intended (expected entry, TP, SL) next to what actually
-    happened (real fill price, size). This makes it easy to spot slippage
-    -- comparing expected_price to the real avg_price -- without cross-
-    referencing two separate log lines.
-
-    Returns a dict with at least: {'id', 'filled_amount', 'avg_price',
-    'symbol', 'expected_price', 'take_profit', 'stop_loss'}. In DRY_RUN
-    mode, no real order is placed -- returns a simulated fill using
-    expected_price (or fails clearly if none given) so calling code can
-    proceed identically either way.
+    Returns: {'status': 'open'|'closed'|'canceled'|..., 'filled_amount',
+    'avg_price'}. On a transient fetch error, returns
+    {'status': 'unknown', ...} rather than raising, so the caller's
+    normal per-tick error handling applies instead of a special case.
     """
-    plan = (f"entry~{expected_price} TP={take_profit} SL={stop_loss} "
-            f"size={quote_amount} USDT")
+    if order_id == 'dry-run-limit-buy':
+        return {'status': 'closed', 'filled_amount': None, 'avg_price': None}
+
+    try:
+        exchange = _get_exchange()
+        order_info = exchange.fetch_order(order_id, symbol=symbol)
+        filled = float(order_info.get('filled', 0) or 0)
+        avg_price = order_info.get('average')
+        avg_price = float(avg_price) if avg_price else None
+        return {
+            'status': order_info.get('status'),
+            'filled_amount': filled,
+            'avg_price': avg_price,
+        }
+    except Exception as e:
+        print(f"[orders] check_order_status error for {order_id}: {e}")
+        return {'status': 'unknown', 'filled_amount': None, 'avg_price': None}
+
+
+def cancel_order(symbol: str, order_id: str) -> bool:
+    """Cancels an open order (e.g. a limit buy that's taken too long to
+    fill). Returns True on success, False on failure (logged, not raised)."""
+    if order_id == 'dry-run-limit-buy':
+        return True
+    try:
+        exchange = _get_exchange()
+        exchange.cancel_order(order_id, symbol=symbol)
+        print(f"[orders] 🚫 Canceled unfilled order {order_id} for {symbol}")
+        return True
+    except Exception as e:
+        print(f"[orders] cancel_order failed for {order_id}: {e}")
+        return False
+
+
+def place_oco_sell(symbol: str, base_amount: float, tp_price: float, sl_price: float) -> dict:
+    """
+    Places an OCO (One-Cancels-the-Other) sell order on Binance so TP
+    and SL are enforced by the exchange itself, not by this bot polling
+    price. Call this ONLY after confirming the buy actually filled
+    (via check_order_status returning 'closed').
+    """
+    exchange = _get_exchange()
+
+    formatted_amount = exchange.amount_to_precision(symbol, base_amount) if not DRY_RUN else round(base_amount, 6)
+    formatted_tp = exchange.price_to_precision(symbol, tp_price) if not DRY_RUN else tp_price
+    formatted_sl_trigger = exchange.price_to_precision(symbol, sl_price) if not DRY_RUN else sl_price
+
+    sl_limit_price = sl_price * 0.998  # small buffer so the SL leg fills even in a fast drop
+    formatted_sl_limit = exchange.price_to_precision(symbol, sl_limit_price) if not DRY_RUN else sl_limit_price
 
     if DRY_RUN:
-        sim_price = expected_price
-        sim_filled = round(quote_amount / sim_price, 6) if sim_price else None
-        print(f"[orders] 🧪 DRY_RUN buy: {symbol} | {plan} (no real order placed)")
+        print(f"[orders] 🧪 DRY_RUN OCO Sell set: {formatted_amount} {symbol.split('/')[0]}")
+        print(f"         Target TP: {formatted_tp} | Target SL Trigger: {formatted_sl_trigger}")
         return {
-            'id': 'dry-run', 'symbol': symbol,
-            'filled_amount': sim_filled, 'avg_price': sim_price, 'dry_run': True,
-            'expected_price': expected_price, 'take_profit': take_profit, 'stop_loss': stop_loss,
+            'id': 'dry-run-oco-sell',
+            'symbol': symbol,
+            'filled_amount': formatted_amount,
+            'take_profit': formatted_tp,
+            'stop_loss': formatted_sl_trigger,
+            'dry_run': True,
+            'status': 'open',
         }
 
-    _check_min_notional(symbol, quote_amount)
+    # NOTE: ccxt's support for Binance OCO orders varies by version --
+    # some versions accept type='oco' via create_order, others need a
+    # dedicated method. TEST THIS SPECIFIC CALL against testnet by
+    # itself before relying on it live; if it errors, check your ccxt
+    # version's docs for the current OCO calling convention.
+    order = exchange.create_order(
+        symbol=symbol, type='OCO', side='sell',
+        amount=formatted_amount, price=formatted_tp,
+        params={
+            'stopPrice': formatted_sl_trigger,
+            'stopLimitPrice': formatted_sl_limit,
+            'stopLimitTimeInForce': 'GTC',
+        }
+    )
+    print(f"[orders] 🎯 LIVE OCO Sell Order set for {symbol}: TP @ {formatted_tp} | SL @ {formatted_sl_trigger}")
+    return order
+
+
+def place_market_buy(symbol: str, quote_amount: float, tp_price: float = None, sl_price: float = None) -> dict:
+    """Market buy for instant fills (no offset, no wait)."""
     exchange = _get_exchange()
-    # createMarketBuyOrder on Binance spot uses quoteOrderQty semantics
-    # via ccxt's `params` when using 'cost' — ccxt normalizes this per
-    # exchange; for Binance specifically, pass quote amount via params.
+
+    if DRY_RUN:
+        try:
+            ticker = exchange.fetch_ticker(symbol)
+            avg_price = float(ticker['last'])
+        except Exception:
+            avg_price = 100.0
+        est_filled = round(quote_amount / avg_price, 6)
+        print(f"[orders] 🧪 DRY_RUN market buy: {quote_amount} USDT of {symbol} (~{est_filled} @ {avg_price:.4f})")
+        return {
+            'id': 'dry-run-market-buy', 'symbol': symbol,
+            'filled_amount': est_filled, 'avg_price': avg_price,
+            'take_profit': tp_price, 'stop_loss': sl_price,
+            'dry_run': True, 'status': 'closed',
+        }
+
+    formatted_quote_amount = exchange.cost_to_precision(symbol, quote_amount)
     order = exchange.create_order(
         symbol=symbol, type='market', side='buy',
-        amount=None,
-        params={'quoteOrderQty': quote_amount},
+        amount=None, params={'quoteOrderQty': formatted_quote_amount},
     )
     filled = float(order.get('filled', 0) or 0)
     cost   = float(order.get('cost', 0) or 0)
-    avg_price = (cost / filled) if filled else None
-
-    slippage_note = ""
-    if expected_price and avg_price:
-        slippage_pct = (avg_price - expected_price) / expected_price * 100
-        slippage_note = f" | slippage: {slippage_pct:+.3f}%"
-
-    print(f"[orders] ✅ LIVE buy filled: {filled} {symbol.split('/')[0]} "
-          f"@ avg {avg_price} (order id {order.get('id')}) | plan: {plan}{slippage_note}")
+    avg_price = (cost / filled) if filled > 0 else float(order.get('price', 0) or 0)
+    print(f"[orders] ✅ LIVE market buy filled: {filled} {symbol.split('/')[0]} @ avg {avg_price:.4f}")
     return {
         'id': order.get('id'), 'symbol': symbol,
-        'filled_amount': filled, 'avg_price': avg_price, 'dry_run': False,
-        'expected_price': expected_price, 'take_profit': take_profit, 'stop_loss': stop_loss,
+        'filled_amount': filled, 'avg_price': avg_price,
+        'take_profit': tp_price, 'stop_loss': sl_price,
+        'dry_run': False, 'status': order.get('status'),
     }
 
 
-def place_market_sell(symbol: str, base_amount: float):
-    """
-    Sells `base_amount` of the base asset at market (e.g.
-    base_amount=0.5 on 'ZEC/USDT' sells 0.5 ZEC).
-    """
+def place_market_sell(symbol: str, base_amount: float) -> dict:
+    """Direct market sell for immediate closing of positions."""
+    exchange = _get_exchange()
+    formatted_amount = float(exchange.amount_to_precision(symbol, base_amount)) if not DRY_RUN else round(base_amount, 6)
+
     if DRY_RUN:
-        print(f"[orders] 🧪 DRY_RUN sell: {base_amount} {symbol.split('/')[0]} (no real order placed)")
+        try:
+            ticker = exchange.fetch_ticker(symbol)
+            avg_price = float(ticker['last'])
+        except Exception:
+            avg_price = 100.0
+        print(f"[orders] 🧪 DRY_RUN market sell: {formatted_amount} {symbol.split('/')[0]}")
         return {
-            'id': 'dry-run', 'symbol': symbol,
-            'filled_amount': None, 'avg_price': None, 'dry_run': True,
+            'id': 'dry-run-market-sell', 'symbol': symbol,
+            'filled_amount': formatted_amount, 'avg_price': avg_price,
+            'dry_run': True, 'status': 'closed',
         }
 
-    exchange = _get_exchange()
     order = exchange.create_order(
-        symbol=symbol, type='market', side='sell', amount=base_amount,
+        symbol=symbol, type='market', side='sell', amount=formatted_amount,
     )
     filled = float(order.get('filled', 0) or 0)
     cost   = float(order.get('cost', 0) or 0)
-    avg_price = (cost / filled) if filled else None
-    print(f"[orders] ✅ LIVE sell filled: {filled} {symbol.split('/')[0]} "
-          f"@ avg {avg_price} (order id {order.get('id')})")
+    avg_price = (cost / filled) if filled > 0 else float(order.get('price', 0) or 0)
+    print(f"[orders] ✅ LIVE market sell filled: {filled} {symbol.split('/')[0]} @ avg {avg_price:.4f}")
     return {
         'id': order.get('id'), 'symbol': symbol,
-        'filled_amount': filled, 'avg_price': avg_price, 'dry_run': False,
+        'filled_amount': filled, 'avg_price': avg_price,
+        'dry_run': False, 'status': order.get('status'),
     }

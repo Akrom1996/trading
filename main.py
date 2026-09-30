@@ -14,48 +14,38 @@ from barrier_model import (
     train_barrier_model, save_barrier_model, load_barrier_model,
     predict_barrier_probabilities, should_enter, TP_PCT, SL_PCT
 )
-# from positions import save_positions, load_positions
 from telegram_bot import (
     notify_signal_with_liq, notify_signal, notify_retrain, notify_daily_limit,
     notify_loss_limit, notify_error, notify_start, notify_stop,
     send_message
 )
 from db import get_last_tp_time, init_db, save_bot_state, load_bot_state, record_closed_trade, get_last_sl_time
-from orders import place_limit_buy, place_market_sell
+from orders import (
+    place_limit_buy, place_market_sell, place_oco_sell,
+    check_order_status, cancel_order,
+)
 
 # ── Symbol: set via env var so the SAME image runs any coin ──
-# docker run -e SYMBOL=SOL/USDT ...  (see docker-compose.yml)
-SYMBOL = os.getenv('SYMBOL', 'ONE/USDT')
+SYMBOL = os.getenv('SYMBOL', 'ZEC/USDT'å)
 
 MAX_RISK_PER_TRADE = 0.02
 MAX_DAILY_LOSS     = 6      # percentage points -- daily_pnl accumulates as e.g. -1.5
-                             # for a -1.5% close, not as a 0.015 fraction, so this
-                             # must be in the same units or it trips on the first SL
-MAX_TRADES_PER_DAY = 8
+MAX_TRADES_PER_DAY = os.getenv('MAX_TRADES_PER_DAY', '20')
 TRAIN_CANDLES      = 2880
 LIVE_CANDLES       = 1000
 MAX_MODEL_AGE_HRS  = 12
-SL_COOLDOWN_MINUTES = 30     # Pause signal generation for 30 minutes after Stop Loss hit
-TP_COOLDOWN_MINUTES = 15      # Pause fresh signal generation for 15 minutes after Take Profit hit
+SL_COOLDOWN_MINUTES = os.getenv('SL_COOLDOWN_MINUTES', '60')
+TP_COOLDOWN_MINUTES = os.getenv('TP_COOLDOWN_MINUTES', '15')
 
-# ── Pyramiding config (Option A) ──────────────────────────
-# Each position uses a fixed TP/SL (from barrier_model's TP_PCT/SL_PCT).
-# When price gets within PYRAMID_TRIGGER_PCT of an *unpyramided* open
-# position's TP, and the barrier model still confirms bullish, open a
-# NEW position at current price with its own fresh TP/SL. Repeat up to
-# MAX_PYRAMID_POSITIONS concurrent positions. Each rung is closed
-# independently on its own TP or SL.
 MAX_PYRAMID_POSITIONS = 6
-PYRAMID_TRIGGER_PCT   = 0.002  # trigger when price is within 0.2% of a position's TP
+PYRAMID_TRIGGER_PCT   = 0.002
 
-# How much quote currency (USDT) to spend on EACH position/rung.
 QUOTE_AMOUNT_PER_TRADE = float(os.getenv('QUOTE_AMOUNT_PER_TRADE', '20'))
+ENTRY_OFFSET_PCT       = float(os.getenv('ENTRY_OFFSET_PCT', '0.004'))
 
-# All entries (fresh + pyramid) place a LIMIT buy this far below the
-# signal price instead of buying at market. Catches a brief post-signal
-# dip for a better entry, at the cost of possibly missing the trade
-# entirely if price never comes back down to the limit price.
-ENTRY_OFFSET_PCT = float(os.getenv('ENTRY_OFFSET_PCT', '0.003'))
+# A limit buy placed below market may never fill. Give up and cancel
+# after this long, rather than leaving a pending position forever.
+PENDING_FILL_TIMEOUT_MINUTES = 15
 
 
 def get_decimal_places(price: float) -> int:
@@ -76,7 +66,7 @@ def retrain_and_save():
     print(f"[{SYMBOL}] Fetching {TRAIN_CANDLES} candles...")
     df = fetch_ohlcv(SYMBOL, '5m', limit=TRAIN_CANDLES)
     df = add_features(df)
-    df = add_labels(df)  # training-only: adds forward-looking target/label
+    df = add_labels(df)
     print(f"  Candles loaded : {len(df)}")
     print(f"  From           : {df['timestamp'].iloc[0].strftime('%Y-%m-%d %H:%M')}")
     print(f"  To             : {df['timestamp'].iloc[-1].strftime('%Y-%m-%d %H:%M')}")
@@ -95,7 +85,6 @@ def retrain_barrier_and_save():
                         symbol=SYMBOL, candles_count=len(df_barrier),
                         label_stats=label_stats)
 
-    # Surface class-imbalance directly in Telegram, not just console
     fib_tp_pct = sum(stats.get('pct', 0) for name, stats in label_stats.items() if 'TP_FIB' in name)
     if fib_tp_pct < 5:
         send_message(
@@ -108,19 +97,20 @@ def retrain_barrier_and_save():
 
 def normalize_position(pos: dict, decimals: int) -> dict:
     """
-    Backward-compat: older saved positions (from the trailing-stop
-    version) have 'peak_price'/'trailing_stop' instead of 'take_profit'.
-    Restoring one of those after this rewrite would KeyError the first
-    time the pyramid-version code reads pos['take_profit']. Fill in
+    Backward-compat for positions saved by older code paths. Fills in
     whatever's missing so a restart never crashes regardless of which
-    version of the bot originally wrote the file.
+    version originally wrote the record.
     """
     if 'take_profit' not in pos:
         pos['take_profit'] = round(pos['entry'] * (1 + TP_PCT), decimals)
     if 'stop_loss' not in pos:
         pos['stop_loss'] = round(pos['entry'] * (1 - SL_PCT), decimals)
     if 'pyramided' not in pos:
-        pos['pyramided'] = True  # unknown history -- don't let it spawn a surprise rung
+        pos['pyramided'] = True
+    if 'status' not in pos:
+        # Older records predate pending-fill tracking -- treat as already
+        # open (best-effort; can't retroactively know if it truly filled).
+        pos['status'] = 'open'
     pos.pop('peak_price', None)
     pos.pop('trailing_stop', None)
     return pos
@@ -141,25 +131,86 @@ def close_position(pos, current_price, reason, daily_pnl):
     )
     send_message(msg)
 
-    # Real (or dry-run) sell so the position isn't just closed on paper
-    if pos.get('base_amount'):
+    # If an OCO sell is live on the exchange for this position, the
+    # exchange has ALREADY executed the matching leg (or will, as soon
+    # as price touches it) -- placing our own market sell on top would
+    # double-sell. Only place a manual sell here as a fallback for
+    # positions that never got OCO protection (e.g. it failed to place).
+    if not pos.get('oco_order_id') and pos.get('base_amount'):
         try:
             place_market_sell(SYMBOL, pos['base_amount'])
         except Exception as e:
             notify_error(f"[{SYMBOL}] SELL order failed on close: {e}")
             print(f"[{SYMBOL}] Order error on close: {e}")
 
-    # Record trade into permanent SQLite history
     record_closed_trade(
-        symbol=SYMBOL,
-        action=pos["action"],
-        entry=pos["entry"],
-        exit_price=current_price,
-        pnl_pct=pnl,
-        reason=reason,
+        symbol=SYMBOL, action=pos["action"], entry=pos["entry"],
+        exit_price=current_price, pnl_pct=pnl, reason=reason,
     )
-
     return daily_pnl + pnl
+
+
+def process_pending_fill(pos, now):
+    """
+    ONE non-blocking check of a pending limit-buy's fill status. Returns
+    'still_pending', 'filled', or 'gave_up' -- caller decides what to do
+    next. Never sleeps or loops -- called once per main loop tick.
+    """
+    status_info = check_order_status(SYMBOL, pos['buy_order_id'])
+    status = status_info['status']
+
+    if status == 'closed':
+        pos['status']      = 'open'
+        pos['base_amount'] = status_info['filled_amount'] or pos.get('base_amount')
+        if status_info['avg_price']:
+            pos['entry'] = status_info['avg_price']  # real fill price, not the limit we asked for
+        return 'filled'
+
+    if status == 'canceled':
+        return 'gave_up'
+
+    # still 'open'/'unknown' -- check timeout
+    placed_at = pos.get('order_placed_at')
+    if placed_at and (now - placed_at).total_seconds() > PENDING_FILL_TIMEOUT_MINUTES * 60:
+        cancel_order(SYMBOL, pos['buy_order_id'])
+        return 'gave_up'
+
+    return 'still_pending'
+
+
+def open_position_with_limit_buy(entry_price, take_profit, stop_loss, now, label):
+    """
+    Places the limit buy and returns a new position dict in 'pending_fill'
+    status -- does NOT wait for the fill. The main loop's position-check
+    block advances it to 'open' (and places the OCO) once check_order_status
+    reports 'closed'.
+    """
+    buy_result = None
+    try:
+        buy_result = place_limit_buy(SYMBOL, entry_price, QUOTE_AMOUNT_PER_TRADE)
+    except Exception as e:
+        notify_error(f"[{SYMBOL}] {label} BUY order failed: {e}")
+        print(f"[{SYMBOL}] Order error on {label}: {e}")
+        return None
+
+    pos = {
+        'action':          'BUY',
+        'entry':           entry_price,
+        'take_profit':     take_profit,
+        'stop_loss':       stop_loss,
+        'pyramided':       False,
+        'status':          'pending_fill',
+        'buy_order_id':    buy_result.get('id'),
+        'order_placed_at': now,
+        'base_amount':     buy_result.get('filled_amount'),  # dry-run fills instantly
+        'oco_order_id':    None,
+        'opened_at':       now.strftime('%H:%M'),
+    }
+    # Dry run "fills" immediately -- advance it right away so downstream
+    # logic (OCO placement, etc.) still exercises the same path.
+    if buy_result.get('status') == 'closed':
+        pos['status'] = 'open'
+    return pos
 
 
 def run_bot(model, scaler, encoder, barrier_model=None, barrier_scaler=None, barrier_encoder=None):
@@ -222,7 +273,7 @@ def run_bot(model, scaler, encoder, barrier_model=None, barrier_scaler=None, bar
             save_bot_state(SYMBOL, open_positions, daily_trades, daily_pnl, last_day)
 
         # Retrain every 1 hour
-        minutes_since_retrain = (now - last_retrain).seconds / 60
+        minutes_since_retrain = (now - last_retrain).total_seconds() / 60
         if minutes_since_retrain >= 60:
             print(f"[{SYMBOL}] [{now.strftime('%H:%M')}] Retraining model...")
             try:
@@ -244,7 +295,6 @@ def run_bot(model, scaler, encoder, barrier_model=None, barrier_scaler=None, bar
                 notify_error(f"[{SYMBOL}] Barrier retrain failed: {e}")
                 print(f"[{SYMBOL}] [{now.strftime('%H:%M')}] Barrier retrain failed: {e}")
 
-        # Check open positions using Candle High/Low
         try:
             df_recent = fetch_ohlcv(SYMBOL, '5m', limit=2)
             latest_candle = df_recent.iloc[-1]
@@ -253,9 +303,54 @@ def run_bot(model, scaler, encoder, barrier_model=None, barrier_scaler=None, bar
             current_price = float(latest_candle['close'])
             decimals      = get_decimal_places(current_price)
 
+            # ── Step 1: advance any pending limit-buy orders ──────
+            # ONE non-blocking check per position per tick -- no waiting.
+            still_pending_positions = []
+            for pos in open_positions:
+                if pos.get('status') != 'pending_fill':
+                    still_pending_positions.append(pos)
+                    continue
+
+                outcome = process_pending_fill(pos, now)
+                if outcome == 'still_pending':
+                    still_pending_positions.append(pos)
+                elif outcome == 'gave_up':
+                    print(f"[{SYMBOL}] Limit buy for position opened at "
+                          f"{pos.get('opened_at')} never filled — giving up")
+                    send_message(f"⏱️ <b>[{SYMBOL}] Limit buy never filled, canceled</b>\n"
+                                 f"Target entry: {pos['entry']}")
+                    daily_trades = max(0, daily_trades - 1)  # give the slot back
+                    # not added to still_pending_positions -> effectively removed
+                elif outcome == 'filled':
+                    print(f"[{SYMBOL}] ✅ Limit buy filled @ {pos['entry']} — placing OCO")
+                    try:
+                        oco_result = place_oco_sell(
+                            SYMBOL, pos['base_amount'], pos['take_profit'], pos['stop_loss']
+                        )
+                        pos['oco_order_id'] = oco_result.get('id') or oco_result.get('orderListId')
+                    except Exception as e:
+                        # Buy filled but OCO failed -- position is REAL and
+                        # UNPROTECTED on the exchange. This is the single
+                        # worst state to be in silently, so alert loudly.
+                        # The bot's own candle-based TP/SL check below still
+                        # covers this position as a fallback.
+                        notify_error(f"🚨 [{SYMBOL}] UNPROTECTED POSITION — buy filled but "
+                                     f"OCO failed: {e}. Bot's own TP/SL check is the only "
+                                     f"protection until this is placed manually or retried.")
+                        print(f"[{SYMBOL}] OCO placement failed: {e}")
+                    still_pending_positions.append(pos)
+
+            open_positions = still_pending_positions
+
+            # ── Step 2: check OPEN positions' TP/SL via candle high/low ──
+            # This remains active even for OCO-protected positions -- it's
+            # what updates our own records/cooldowns/daily_pnl. The OCO on
+            # the exchange is the actual execution guarantee; this is our
+            # bookkeeping of what already happened (or a fallback sell if
+            # OCO placement failed above).
             closed_positions = []
             for pos in open_positions:
-                if pos['action'] != 'BUY':
+                if pos.get('status') != 'open' or pos['action'] != 'BUY':
                     continue
 
                 if candle_high >= pos['take_profit']:
@@ -268,24 +363,21 @@ def run_bot(model, scaler, encoder, barrier_model=None, barrier_scaler=None, bar
                     daily_pnl = close_position(pos, pos['stop_loss'], "SL Hit (Candle Low)", daily_pnl)
                     closed_positions.append(pos)
                     last_sl_time = now
-                    print(
-                        f"⏸️ <b>[{SYMBOL}] Stop Loss Cooldown Initiated</b>\n"
-                        f"SL was hit. Pausing new signal generation for {SL_COOLDOWN_MINUTES} minutes."
-                    )
+                    print(f"⏸️ [{SYMBOL}] Stop Loss Cooldown Initiated ({SL_COOLDOWN_MINUTES} minutes)")
 
             for pos in closed_positions:
                 open_positions.remove(pos)
-            if closed_positions:
+            if closed_positions or still_pending_positions != open_positions:
                 save_bot_state(SYMBOL, open_positions, daily_trades, daily_pnl, last_day)
 
-            # Pyramiding Check
+            # ── Step 3: Pyramiding ──────────────────────────────
             is_sl_cooldown = last_sl_time is not None and (now - last_sl_time).total_seconds() < SL_COOLDOWN_MINUTES * 60
             if (len(open_positions) < MAX_PYRAMID_POSITIONS
                     and daily_trades < MAX_TRADES_PER_DAY
                     and barrier_model is not None
                     and not is_sl_cooldown):
                 for pos in open_positions:
-                    if pos['action'] != 'BUY' or pos.get('pyramided'):
+                    if pos.get('status') != 'open' or pos['action'] != 'BUY' or pos.get('pyramided'):
                         continue
                     near_tp = current_price >= pos['take_profit'] * (1 - PYRAMID_TRIGGER_PCT)
                     if not near_tp:
@@ -311,37 +403,18 @@ def run_bot(model, scaler, encoder, barrier_model=None, barrier_scaler=None, bar
                         new_tp    = round(new_entry * (1 + rung_tp_pct), decimals)
                         new_sl    = round(new_entry * (1 - SL_PCT), decimals)
 
-                        pyr_buy_result = None
-                        try:
-                            pyr_buy_result = place_limit_buy(
-                                SYMBOL, new_entry, QUOTE_AMOUNT_PER_TRADE,
-                                take_profit=new_tp, stop_loss=new_sl,
+                        new_pos = open_position_with_limit_buy(new_entry, new_tp, new_sl, now, 'pyramid entry')
+                        if new_pos:
+                            open_positions.append(new_pos)
+                            daily_trades += 1
+                            send_message(
+                                f"🔼 <b>[{SYMBOL}] Pyramid entry #{len(open_positions)} (pending fill)</b>\n\n"
+                                f"💰 Entry: <b>{new_entry}</b>\n"
+                                f"🎯 TP:    <b>{new_tp} (+{rung_tp_pct*100:.0f}% Fib)</b>\n"
+                                f"🛑 SL:    <b>{new_sl}</b>\n"
+                                f"📊 {reason}"
                             )
-                        except Exception as e:
-                            notify_error(f"[{SYMBOL}] Pyramid BUY order failed: {e}")
-                            print(f"[{SYMBOL}] Order error on pyramid entry: {e}")
-
-                        pyr_base_amount = pyr_buy_result.get('filled_amount') if pyr_buy_result else None
-
-                        open_positions.append({
-                            'action':      'BUY',
-                            'entry':       new_entry,
-                            'take_profit': new_tp,
-                            'stop_loss':   new_sl,
-                            'pyramided':   False,
-                            'base_amount': pyr_base_amount,
-                            'opened_at':   now.strftime('%H:%M'),
-                        })
-                        daily_trades += 1
-                        send_message(
-                            f"🔼 <b>[{SYMBOL}] Pyramid entry #{len(open_positions)}</b>\n\n"
-                            f"💰 Entry: <b>{new_entry}</b>\n"
-                            f"🎯 TP:    <b>{new_tp} (+{rung_tp_pct*100:.0f}% Fib)</b>\n"
-                            f"🛑 SL:    <b>{new_sl}</b>\n"
-                            # f"💵 Size:  <b>{QUOTE_AMOUNT_PER_TRADE} USDT</b>\n"
-                            f"📊 {reason}"
-                        )
-                        save_bot_state(SYMBOL, open_positions, daily_trades, daily_pnl, last_day)
+                            save_bot_state(SYMBOL, open_positions, daily_trades, daily_pnl, last_day)
                     break
 
         except Exception as e:
@@ -353,7 +426,7 @@ def run_bot(model, scaler, encoder, barrier_model=None, barrier_scaler=None, bar
             print(f"[{SYMBOL}] [{now.strftime('%H:%M')}] Max trades reached | Open positions: {open_count}")
             if open_count > 0 and not limit_notice_sent:
                 pos_summary = "\n".join([
-                    f"  🟢 BUY | Entry: {p['entry']} | TP: {p['take_profit']} | SL: {p['stop_loss']}"
+                    f"  🟢 BUY | Entry: {p['entry']} | TP: {p['take_profit']} | SL: {p['stop_loss']} | {p.get('status')}"
                     for p in open_positions
                 ])
                 send_message(
@@ -374,7 +447,6 @@ def run_bot(model, scaler, encoder, barrier_model=None, barrier_scaler=None, bar
             time.sleep(3600)
             continue
 
-        # Check Stop Loss Cooldown
         if last_sl_time is not None:
             seconds_since_sl = (now - last_sl_time).total_seconds()
             if seconds_since_sl < SL_COOLDOWN_MINUTES * 60:
@@ -385,7 +457,6 @@ def run_bot(model, scaler, encoder, barrier_model=None, barrier_scaler=None, bar
             else:
                 last_sl_time = None
 
-        # Check Take Profit Cooldown
         if last_tp_time is not None:
             seconds_since_tp = (now - last_tp_time).total_seconds()
             if seconds_since_tp < TP_COOLDOWN_MINUTES * 60:
@@ -414,7 +485,7 @@ def run_bot(model, scaler, encoder, barrier_model=None, barrier_scaler=None, bar
                 if liq['liq_spike']:
                     signal['action'] = None
 
-            barrier_probs = {}  # Initialized safely to prevent UnboundLocalError
+            barrier_probs = {}
             if signal['action'] == 'BUY':
                 decimals = get_decimal_places(current_price)
                 enter    = False
@@ -462,47 +533,23 @@ def run_bot(model, scaler, encoder, barrier_model=None, barrier_scaler=None, bar
                         level_text += (f"  {'⬆️' if lv['direction'] == 'ABOVE' else '⬇️'} "
                                         f"${lv['price']} ({lv['distance']}% away — ${lv['amount']:,.0f})\n")
 
-                notify_signal_with_liq(signal, daily_trades + 1, liq, level_text, symbol=SYMBOL)
+                notify_signal_with_liq(signal, daily_trades + 1, liq, level_text, symbol=SYMBOL,
+                                        max_trades=MAX_TRADES_PER_DAY)
 
-                # Place a LIMIT buy at signal['entry'] (already offset
-                # below the raw signal price by ENTRY_OFFSET_PCT) right
-                # alongside the Telegram notification -- same trade plan
-                # (entry/TP/SL/size) goes to both, so what the channel
-                # announces matches what got (or would get) ordered.
-                # NOTE: unlike a market buy, this may not fill immediately
-                # -- if price never dips to signal['entry'], the order
-                # stays open and this position is recorded before we know
-                # for certain it filled. See place_limit_buy's docstring.
-                buy_result = None
-                try:
-                    buy_result = place_limit_buy(
-                        SYMBOL, signal['entry'], QUOTE_AMOUNT_PER_TRADE,
-                        take_profit=signal['take_profit'],
-                        stop_loss=signal['stop_loss'],
-                    )
-                except Exception as e:
-                    notify_error(f"[{SYMBOL}] BUY order failed: {e}")
-                    print(f"[{SYMBOL}] Order error on entry: {e}")
-
-                base_amount = buy_result.get('filled_amount') if buy_result else None
-
-                open_positions.append({
-                    'action':      signal['action'],
-                    'entry':       signal['entry'],
-                    'take_profit': signal['take_profit'],
-                    'stop_loss':   signal['stop_loss'],
-                    'pyramided':   False,
-                    'base_amount': base_amount,
-                    'opened_at':   now.strftime('%H:%M'),
-                })
-                daily_trades += 1
-                save_bot_state(SYMBOL, open_positions, daily_trades, daily_pnl, last_day)
+                new_pos = open_position_with_limit_buy(
+                    signal['entry'], signal['take_profit'], signal['stop_loss'], now, 'fresh entry'
+                )
+                if new_pos:
+                    open_positions.append(new_pos)
+                    daily_trades += 1
+                    save_bot_state(SYMBOL, open_positions, daily_trades, daily_pnl, last_day)
 
         except Exception as e:
             notify_error(f"[{SYMBOL}] {e}")
             print(f"[{SYMBOL}] [{now.strftime('%H:%M')}] Error: {e}")
 
         time.sleep(60)
+
 
 if __name__ == "__main__":
     print("=" * 50)
@@ -516,7 +563,7 @@ if __name__ == "__main__":
 
     if model is not None and model_is_fresh(metadata, max_age_hours=MAX_MODEL_AGE_HRS):
         trained_at = metadata['trained_at'].strftime('%Y-%m-%d %H:%M')
-        age_hours  = (datetime.now() - metadata['trained_at']).seconds / 3600
+        age_hours  = (datetime.now() - metadata['trained_at']).total_seconds() / 3600
         print(f"  Saved model found!")
         print(f"  Trained at : {trained_at}")
         print(f"  Candles    : {metadata['candles_count']}")
@@ -544,7 +591,6 @@ if __name__ == "__main__":
     else:
         print(f"  Saved barrier model found (trained {barrier_meta['trained_at']})")
 
-    # notify_start(SYMBOL)
     print("Bot started. Press Ctrl+C to stop.")
     print("=" * 50)
 
