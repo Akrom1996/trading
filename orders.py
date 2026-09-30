@@ -103,29 +103,38 @@ def get_available_balance(asset: str) -> float:
     return balance.get(asset, {}).get('free', 0.0)
 
 
-def place_limit_buy(symbol: str, limit_price: float, quote_amount: float):
+def place_limit_buy(symbol: str, limit_price: float, quote_amount: float,
+                     take_profit: float = None, stop_loss: float = None):
     """
     Places a LIMIT buy at `limit_price` (intentionally below current
-    market, per-symbol offset -- see ENTRY_OFFSET_PCT in main.py) rather
-    than buying immediately at market. Used when a coin's price tends
-    to dip briefly after a BUY signal before the real move starts --
-    this tries to catch that dip instead of paying the pre-dip price.
+    market, per an entry offset -- see ENTRY_OFFSET_PCT in main.py)
+    rather than buying immediately at market. Used when a coin's price
+    tends to dip briefly after a BUY signal before the real move starts
+    -- this tries to catch that dip instead of paying the pre-dip price.
 
-    NOTE: unlike the market-order functions, this does NOT guarantee
-    an immediate fill. If price never comes back down to limit_price,
-    the order sits open (or, if never filled, effectively misses the
-    trade). Returns immediately after placing -- filled_amount will be
-    0 if the order hasn't filled yet at the time of this call.
+    `take_profit`/`stop_loss` are NOT sent to Binance -- same as
+    place_market_buy, they're accepted purely so the full trade plan
+    (entry, TP, SL, size) is visible together in the log line.
+
+    NOTE: unlike a market order, this does NOT guarantee an immediate
+    fill. If price never comes back down to limit_price, the order
+    sits open (or, if never filled by the time you check, effectively
+    misses the trade). Returns immediately after placing -- filled_amount
+    will be 0 if the order hasn't filled yet at the time of this call.
+    Callers should treat a non-full fill as "position not fully open
+    yet" rather than assuming the whole size is on immediately.
     """
     base_amount_estimate = round(quote_amount / limit_price, 6)
+    plan = f"TP={take_profit} SL={stop_loss} size={quote_amount} USDT"
 
     if DRY_RUN:
         print(f"[orders] 🧪 DRY_RUN limit buy: {base_amount_estimate} {symbol.split('/')[0]} "
-              f"@ {limit_price} ({quote_amount} USDT, no real order placed)")
+              f"@ {limit_price} | {plan} (no real order placed)")
         return {
             'id': 'dry-run', 'symbol': symbol, 'limit_price': limit_price,
             'filled_amount': base_amount_estimate, 'avg_price': limit_price,
             'dry_run': True, 'status': 'closed',
+            'take_profit': take_profit, 'stop_loss': stop_loss,
         }
 
     exchange = _get_exchange()
@@ -136,29 +145,47 @@ def place_limit_buy(symbol: str, limit_price: float, quote_amount: float):
     filled = float(order.get('filled', 0) or 0)
     print(f"[orders] 📝 LIVE limit buy placed: {base_amount_estimate} {symbol.split('/')[0]} "
           f"@ {limit_price} (order id {order.get('id')}, filled so far: {filled}, "
-          f"status: {order.get('status')})")
+          f"status: {order.get('status')}) | plan: {plan}")
     return {
         'id': order.get('id'), 'symbol': symbol, 'limit_price': limit_price,
         'filled_amount': filled, 'avg_price': limit_price,
         'dry_run': False, 'status': order.get('status'),
+        'take_profit': take_profit, 'stop_loss': stop_loss,
     }
 
 
-def place_market_buy(symbol: str, quote_amount: float):
+def place_market_buy(symbol: str, quote_amount: float, expected_price: float = None,
+                      take_profit: float = None, stop_loss: float = None):
     """
     Buys `quote_amount` worth of `symbol`'s quote currency (e.g.
     quote_amount=50 on 'ZEC/USDT' spends 50 USDT buying ZEC at market).
 
+    `expected_price`, `take_profit`, `stop_loss` are NOT sent to Binance
+    (a market order has no price/TP/SL fields) -- they're accepted here
+    purely so the caller's full trade plan is visible in one place: the
+    order log line, the Telegram message, and the returned dict all show
+    what was intended (expected entry, TP, SL) next to what actually
+    happened (real fill price, size). This makes it easy to spot slippage
+    -- comparing expected_price to the real avg_price -- without cross-
+    referencing two separate log lines.
+
     Returns a dict with at least: {'id', 'filled_amount', 'avg_price',
-    'symbol'}. In DRY_RUN mode, no real order is placed -- returns a
-    simulated fill using the current market price so calling code can
+    'symbol', 'expected_price', 'take_profit', 'stop_loss'}. In DRY_RUN
+    mode, no real order is placed -- returns a simulated fill using
+    expected_price (or fails clearly if none given) so calling code can
     proceed identically either way.
     """
+    plan = (f"entry~{expected_price} TP={take_profit} SL={stop_loss} "
+            f"size={quote_amount} USDT")
+
     if DRY_RUN:
-        print(f"[orders] 🧪 DRY_RUN buy: {quote_amount} USDT of {symbol} (no real order placed)")
+        sim_price = expected_price
+        sim_filled = round(quote_amount / sim_price, 6) if sim_price else None
+        print(f"[orders] 🧪 DRY_RUN buy: {symbol} | {plan} (no real order placed)")
         return {
             'id': 'dry-run', 'symbol': symbol,
-            'filled_amount': None, 'avg_price': None, 'dry_run': True,
+            'filled_amount': sim_filled, 'avg_price': sim_price, 'dry_run': True,
+            'expected_price': expected_price, 'take_profit': take_profit, 'stop_loss': stop_loss,
         }
 
     _check_min_notional(symbol, quote_amount)
@@ -174,11 +201,18 @@ def place_market_buy(symbol: str, quote_amount: float):
     filled = float(order.get('filled', 0) or 0)
     cost   = float(order.get('cost', 0) or 0)
     avg_price = (cost / filled) if filled else None
+
+    slippage_note = ""
+    if expected_price and avg_price:
+        slippage_pct = (avg_price - expected_price) / expected_price * 100
+        slippage_note = f" | slippage: {slippage_pct:+.3f}%"
+
     print(f"[orders] ✅ LIVE buy filled: {filled} {symbol.split('/')[0]} "
-          f"@ avg {avg_price} (order id {order.get('id')})")
+          f"@ avg {avg_price} (order id {order.get('id')}) | plan: {plan}{slippage_note}")
     return {
         'id': order.get('id'), 'symbol': symbol,
         'filled_amount': filled, 'avg_price': avg_price, 'dry_run': False,
+        'expected_price': expected_price, 'take_profit': take_profit, 'stop_loss': stop_loss,
     }
 
 

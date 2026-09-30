@@ -21,6 +21,7 @@ from telegram_bot import (
     send_message
 )
 from db import get_last_tp_time, init_db, save_bot_state, load_bot_state, record_closed_trade, get_last_sl_time
+from orders import place_limit_buy, place_market_sell
 
 # ── Symbol: set via env var so the SAME image runs any coin ──
 # docker run -e SYMBOL=SOL/USDT ...  (see docker-compose.yml)
@@ -34,8 +35,8 @@ MAX_TRADES_PER_DAY = 10
 TRAIN_CANDLES      = 2880
 LIVE_CANDLES       = 1000
 MAX_MODEL_AGE_HRS  = 12
-SL_COOLDOWN_MINUTES = 60     # Pause signal generation for 1 hour after Stop Loss hit
-TP_COOLDOWN_MINUTES = 5      # Pause fresh signal generation for 5 minutes after Take Profit hit
+SL_COOLDOWN_MINUTES = 30     # Pause signal generation for 30 minutes after Stop Loss hit
+TP_COOLDOWN_MINUTES = 15      # Pause fresh signal generation for 15 minutes after Take Profit hit
 
 # ── Pyramiding config (Option A) ──────────────────────────
 # Each position uses a fixed TP/SL (from barrier_model's TP_PCT/SL_PCT).
@@ -46,6 +47,15 @@ TP_COOLDOWN_MINUTES = 5      # Pause fresh signal generation for 5 minutes after
 # independently on its own TP or SL.
 MAX_PYRAMID_POSITIONS = 6
 PYRAMID_TRIGGER_PCT   = 0.002  # trigger when price is within 0.2% of a position's TP
+
+# How much quote currency (USDT) to spend on EACH position/rung.
+QUOTE_AMOUNT_PER_TRADE = float(os.getenv('QUOTE_AMOUNT_PER_TRADE', '20'))
+
+# All entries (fresh + pyramid) place a LIMIT buy this far below the
+# signal price instead of buying at market. Catches a brief post-signal
+# dip for a better entry, at the cost of possibly missing the trade
+# entirely if price never comes back down to the limit price.
+ENTRY_OFFSET_PCT = float(os.getenv('ENTRY_OFFSET_PCT', '0.004'))
 
 
 def get_decimal_places(price: float) -> int:
@@ -130,6 +140,14 @@ def close_position(pos, current_price, reason, daily_pnl):
         f"📈 PnL:    <b>{pnl:+.2f}%</b>"
     )
     send_message(msg)
+
+    # Real (or dry-run) sell so the position isn't just closed on paper
+    if pos.get('base_amount'):
+        try:
+            place_market_sell(SYMBOL, pos['base_amount'])
+        except Exception as e:
+            notify_error(f"[{SYMBOL}] SELL order failed on close: {e}")
+            print(f"[{SYMBOL}] Order error on close: {e}")
 
     # Record trade into permanent SQLite history
     record_closed_trade(
@@ -288,16 +306,30 @@ def run_bot(model, scaler, encoder, barrier_model=None, barrier_scaler=None, bar
                     pos['pyramided'] = True
 
                     if still_bullish:
-                        new_entry = current_price
+                        new_entry = round(current_price * (1 - ENTRY_OFFSET_PCT), decimals)
                         rung_tp_pct = pyr_barrier_probs.get('recommended_tp', TP_PCT)
                         new_tp    = round(new_entry * (1 + rung_tp_pct), decimals)
                         new_sl    = round(new_entry * (1 - SL_PCT), decimals)
+
+                        pyr_buy_result = None
+                        try:
+                            pyr_buy_result = place_limit_buy(
+                                SYMBOL, new_entry, QUOTE_AMOUNT_PER_TRADE,
+                                take_profit=new_tp, stop_loss=new_sl,
+                            )
+                        except Exception as e:
+                            notify_error(f"[{SYMBOL}] Pyramid BUY order failed: {e}")
+                            print(f"[{SYMBOL}] Order error on pyramid entry: {e}")
+
+                        pyr_base_amount = pyr_buy_result.get('filled_amount') if pyr_buy_result else None
+
                         open_positions.append({
                             'action':      'BUY',
                             'entry':       new_entry,
                             'take_profit': new_tp,
                             'stop_loss':   new_sl,
                             'pyramided':   False,
+                            'base_amount': pyr_base_amount,
                             'opened_at':   now.strftime('%H:%M'),
                         })
                         daily_trades += 1
@@ -306,6 +338,7 @@ def run_bot(model, scaler, encoder, barrier_model=None, barrier_scaler=None, bar
                             f"💰 Entry: <b>{new_entry}</b>\n"
                             f"🎯 TP:    <b>{new_tp} (+{rung_tp_pct*100:.0f}% Fib)</b>\n"
                             f"🛑 SL:    <b>{new_sl}</b>\n"
+                            # f"💵 Size:  <b>{QUOTE_AMOUNT_PER_TRADE} USDT</b>\n"
                             f"📊 {reason}"
                         )
                         save_bot_state(SYMBOL, open_positions, daily_trades, daily_pnl, last_day)
@@ -408,10 +441,11 @@ def run_bot(model, scaler, encoder, barrier_model=None, barrier_scaler=None, bar
                 barrier_tp = barrier_probs.get('recommended_tp', 0.03) if barrier_model is not None else model_tp
                 effective_tp = max(model_tp, barrier_tp)
 
+                adjusted_entry = round(current_price * (1 - ENTRY_OFFSET_PCT), decimals)
                 signal['fib_target_pct'] = effective_tp
-                signal['entry']       = current_price
-                signal['take_profit'] = round(current_price * (1 + effective_tp), decimals)
-                signal['stop_loss']   = round(current_price * (1 - SL_PCT), decimals)
+                signal['entry']       = adjusted_entry
+                signal['take_profit'] = round(adjusted_entry * (1 + effective_tp), decimals)
+                signal['stop_loss']   = round(adjusted_entry * (1 - SL_PCT), decimals)
 
             liq_info = f"Liq: {liq['bias']} ({liq['liq_ratio']:.0%})" if liq else "Liq: N/A"
             print(f"[{SYMBOL}] [{now.strftime('%H:%M')}] "
@@ -429,12 +463,36 @@ def run_bot(model, scaler, encoder, barrier_model=None, barrier_scaler=None, bar
                                         f"${lv['price']} ({lv['distance']}% away — ${lv['amount']:,.0f})\n")
 
                 notify_signal_with_liq(signal, daily_trades + 1, liq, level_text, symbol=SYMBOL)
+
+                # Place a LIMIT buy at signal['entry'] (already offset
+                # below the raw signal price by ENTRY_OFFSET_PCT) right
+                # alongside the Telegram notification -- same trade plan
+                # (entry/TP/SL/size) goes to both, so what the channel
+                # announces matches what got (or would get) ordered.
+                # NOTE: unlike a market buy, this may not fill immediately
+                # -- if price never dips to signal['entry'], the order
+                # stays open and this position is recorded before we know
+                # for certain it filled. See place_limit_buy's docstring.
+                buy_result = None
+                try:
+                    buy_result = place_limit_buy(
+                        SYMBOL, signal['entry'], QUOTE_AMOUNT_PER_TRADE,
+                        take_profit=signal['take_profit'],
+                        stop_loss=signal['stop_loss'],
+                    )
+                except Exception as e:
+                    notify_error(f"[{SYMBOL}] BUY order failed: {e}")
+                    print(f"[{SYMBOL}] Order error on entry: {e}")
+
+                base_amount = buy_result.get('filled_amount') if buy_result else None
+
                 open_positions.append({
                     'action':      signal['action'],
                     'entry':       signal['entry'],
                     'take_profit': signal['take_profit'],
                     'stop_loss':   signal['stop_loss'],
                     'pyramided':   False,
+                    'base_amount': base_amount,
                     'opened_at':   now.strftime('%H:%M'),
                 })
                 daily_trades += 1
