@@ -26,7 +26,7 @@ from orders import (
 )
 
 # ── Symbol: set via env var so the SAME image runs any coin ──
-SYMBOL = os.getenv('SYMBOL', 'ZEC/USDT'å)
+SYMBOL = os.getenv('SYMBOL', 'ZEC/USDT')
 
 MAX_RISK_PER_TRADE = 0.02
 MAX_DAILY_LOSS     = 6      # percentage points -- daily_pnl accumulates as e.g. -1.5
