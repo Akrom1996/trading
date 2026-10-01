@@ -4,7 +4,7 @@ import os
 TELEGRAM_TOKEN   = os.getenv('TELEGRAM_TOKEN', '')   # from BotFather
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')      # from userinfobot
 TELEGRAM_ERROR_CHAT_ID = os.getenv('TELEGRAM_ERROR_CHAT_ID')      # from error bot
-MAX_TRADES_PER_DAY = os.getenv('MAX_TRADES_PER_DAY', '20')
+MAX_TRADES_PER_DAY = os.getenv('MAX_TRADES_PER_DAY', '10')
 
 def notify_signal_with_liq(signal, daily_trades, liq, level_text='',symbol=''):
     emoji = '🟢' if signal['action'] == 'BUY' else '🔴'

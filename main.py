@@ -39,7 +39,7 @@ PYRAMID_TRIGGER_PCT   = 0.002
 
 SL_COOLDOWN_MINUTES = float(os.getenv('SL_COOLDOWN_MINUTES', '30'))
 TP_COOLDOWN_MINUTES = float(os.getenv('TP_COOLDOWN_MINUTES', '10'))
-MAX_TRADES_PER_DAY  = int(os.getenv('MAX_TRADES_PER_DAY', '8'))
+MAX_TRADES_PER_DAY  = int(os.getenv('MAX_TRADES_PER_DAY', '10'))
 QUOTE_AMOUNT_PER_TRADE = float(os.getenv('QUOTE_AMOUNT_PER_TRADE', '20'))
 ENTRY_OFFSET_PCT    = float(os.getenv('ENTRY_OFFSET_PCT', '0.003'))
 
@@ -533,8 +533,7 @@ def run_bot(model, scaler, encoder, barrier_model=None, barrier_scaler=None, bar
                         level_text += (f"  {'⬆️' if lv['direction'] == 'ABOVE' else '⬇️'} "
                                         f"${lv['price']} ({lv['distance']}% away — ${lv['amount']:,.0f})\n")
 
-                notify_signal_with_liq(signal, daily_trades + 1, liq, level_text, symbol=SYMBOL,
-                                        max_trades=MAX_TRADES_PER_DAY)
+                notify_signal_with_liq(signal, daily_trades + 1, liq, level_text, symbol=SYMBOL)
 
                 new_pos = open_position_with_limit_buy(
                     signal['entry'], signal['take_profit'], signal['stop_loss'], now, 'fresh entry'
