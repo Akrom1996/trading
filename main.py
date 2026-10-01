@@ -30,18 +30,18 @@ SYMBOL = os.getenv('SYMBOL', 'ZEC/USDT')
 
 MAX_RISK_PER_TRADE = 0.02
 MAX_DAILY_LOSS     = 6      # percentage points -- daily_pnl accumulates as e.g. -1.5
-MAX_TRADES_PER_DAY = os.getenv('MAX_TRADES_PER_DAY', '20')
 TRAIN_CANDLES      = 2880
 LIVE_CANDLES       = 1000
 MAX_MODEL_AGE_HRS  = 12
-SL_COOLDOWN_MINUTES = os.getenv('SL_COOLDOWN_MINUTES', '60')
-TP_COOLDOWN_MINUTES = os.getenv('TP_COOLDOWN_MINUTES', '15')
 
 MAX_PYRAMID_POSITIONS = 6
 PYRAMID_TRIGGER_PCT   = 0.002
 
+SL_COOLDOWN_MINUTES = float(os.getenv('SL_COOLDOWN_MINUTES', '30'))
+TP_COOLDOWN_MINUTES = float(os.getenv('TP_COOLDOWN_MINUTES', '10'))
+MAX_TRADES_PER_DAY  = int(os.getenv('MAX_TRADES_PER_DAY', '8'))
 QUOTE_AMOUNT_PER_TRADE = float(os.getenv('QUOTE_AMOUNT_PER_TRADE', '20'))
-ENTRY_OFFSET_PCT       = float(os.getenv('ENTRY_OFFSET_PCT', '0.004'))
+ENTRY_OFFSET_PCT    = float(os.getenv('ENTRY_OFFSET_PCT', '0.003'))
 
 # A limit buy placed below market may never fill. Give up and cancel
 # after this long, rather than leaving a pending position forever.
