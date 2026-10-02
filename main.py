@@ -180,19 +180,12 @@ def process_pending_fill(pos, now):
 
 def open_position_with_limit_buy(entry_price, take_profit, stop_loss, now, label):
     """
-    Places the limit buy and returns a new position dict in 'pending_fill'
-    status -- does NOT wait for the fill. The main loop's position-check
-    block advances it to 'open' (and places the OCO) once check_order_status
-    reports 'closed'.
+    Places the limit buy and returns a new position dict.
+    If the order fails (e.g., Insufficient Funds), returns a position with status 'failed'
+    so state/DB can be recorded, preventing constantTelegram spam every minute.
     """
-    buy_result = None
-    try:
-        buy_result = place_limit_buy(SYMBOL, entry_price, QUOTE_AMOUNT_PER_TRADE)
-    except Exception as e:
-        notify_error(f"[{SYMBOL}] {label} BUY order failed: {e}")
-        print(f"[{SYMBOL}] Order error on {label}: {e}")
-        return None
-
+    now_iso = now.isoformat() if isinstance(now, datetime) else now
+    
     pos = {
         'action':          'BUY',
         'entry':           entry_price,
@@ -200,18 +193,33 @@ def open_position_with_limit_buy(entry_price, take_profit, stop_loss, now, label
         'stop_loss':       stop_loss,
         'pyramided':       False,
         'status':          'pending_fill',
-        'buy_order_id':    buy_result.get('id'),
-        'order_placed_at': now.timestamp(),
-        'base_amount':     buy_result.get('filled_amount'),  # dry-run fills instantly
+        'buy_order_id':    None,
+        'order_placed_at': now_iso,
+        'base_amount':     0.0,
         'oco_order_id':    None,
-        'opened_at':       now.strftime('%H:%M'),
+        'opened_at':       now.strftime('%H:%M') if isinstance(now, datetime) else now,
     }
-    # Dry run "fills" immediately -- advance it right away so downstream
-    # logic (OCO placement, etc.) still exercises the same path.
-    # if buy_result.get('status') == 'closed':
-    #     pos['status'] = 'open'
-    return pos
 
+    try:
+        buy_result = place_limit_buy(SYMBOL, entry_price, QUOTE_AMOUNT_PER_TRADE)
+        pos['buy_order_id']  = buy_result.get('id')
+        pos['base_amount']   = buy_result.get('filled_amount')
+
+        # if buy_result.get('status') == 'closed':
+        #     pos['status'] = 'open'
+
+        return pos
+
+    except Exception as e:
+        # Mark as failed so it gets recorded in DB and stops retrying
+        pos['status'] = 'failed'
+        pos['error']  = str(e)
+        
+        notify_error(f"❌ [{SYMBOL}] {label} BUY failed (Insufficient funds or exchange error): {e}")
+        print(f"[{SYMBOL}] Order placement failed: {e}")
+        
+        return pos
+    
 
 def run_bot(model, scaler, encoder, barrier_model=None, barrier_scaler=None, barrier_encoder=None):
     saved_positions, saved_trades, saved_pnl, saved_day = load_bot_state(SYMBOL)

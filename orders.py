@@ -89,6 +89,14 @@ def place_limit_buy(symbol: str, limit_price: float, quote_amount: float) -> dic
     for it to fill. Check fill status later with check_order_status().
     """
     exchange = _get_exchange()
+    
+    if not DRY_RUN:
+        balance = get_available_balance(symbol)
+        if balance < quote_amount:
+            raise RuntimeError(
+                f"Insufficient balance: {balance:.2f} {symbol} available, "
+                f"{quote_amount:.2f} {symbol} required."
+            )
 
     formatted_price = float(exchange.price_to_precision(symbol, limit_price)) if not DRY_RUN else limit_price
     raw_amount = quote_amount / formatted_price
