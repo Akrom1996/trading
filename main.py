@@ -201,15 +201,15 @@ def open_position_with_limit_buy(entry_price, take_profit, stop_loss, now, label
         'pyramided':       False,
         'status':          'pending_fill',
         'buy_order_id':    buy_result.get('id'),
-        'order_placed_at': now,
+        'order_placed_at': now.timestamp(),
         'base_amount':     buy_result.get('filled_amount'),  # dry-run fills instantly
         'oco_order_id':    None,
         'opened_at':       now.strftime('%H:%M'),
     }
     # Dry run "fills" immediately -- advance it right away so downstream
     # logic (OCO placement, etc.) still exercises the same path.
-    if buy_result.get('status') == 'closed':
-        pos['status'] = 'open'
+    # if buy_result.get('status') == 'closed':
+    #     pos['status'] = 'open'
     return pos
 
 
