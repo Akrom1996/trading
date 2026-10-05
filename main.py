@@ -47,6 +47,9 @@ ENTRY_OFFSET_PCT    = float(os.getenv('ENTRY_OFFSET_PCT', '0.003'))
 # after this long, rather than leaving a pending position forever.
 PENDING_FILL_TIMEOUT_MINUTES = 15
 
+# The only statuses the main loop knows how to handle natively.
+VALID_STATUSES = ('open', 'pending_fill')
+
 
 def get_decimal_places(price: float) -> int:
     if price >= 100:  return 2
@@ -111,6 +114,15 @@ def normalize_position(pos: dict, decimals: int) -> dict:
         # Older records predate pending-fill tracking -- treat as already
         # open (best-effort; can't retroactively know if it truly filled).
         pos['status'] = 'open'
+    if pos.get('status') not in VALID_STATUSES:
+        # Legacy/unknown status (e.g. 'failed' written by an older version
+        # when the buy order errored). The order never filled on this
+        # account, so track it as a signal-only position -- that way the
+        # normal TP/SL check can still close it and free the slot.
+        print(f"[{SYMBOL}] Migrating legacy position status "
+              f"'{pos.get('status')}' -> 'open' (virtual)")
+        pos['status']  = 'open'
+        pos['virtual'] = True
     if 'virtual' not in pos:
         pos['virtual'] = False
     pos.pop('peak_price', None)
@@ -138,9 +150,9 @@ def close_position(pos, current_price, reason, daily_pnl):
     # exchange has ALREADY executed the matching leg (or will, as soon
     # as price touches it) -- placing our own market sell on top would
     # double-sell. Only place a manual sell here as a fallback for
-    # positions that never got OCO protection (e.g. it failed to place,
-    # or it's a virtual signal-only position with no real holdings).
-    if not pos.get('oco_order_id') and pos.get('base_amount'):
+    # positions that never got OCO protection (e.g. it failed to place).
+    # Virtual positions hold nothing on this account, so never sell for them.
+    if not pos.get('virtual') and not pos.get('oco_order_id') and pos.get('base_amount'):
         try:
             place_market_sell(SYMBOL, pos['base_amount'])
         except Exception as e:
@@ -175,6 +187,12 @@ def process_pending_fill(pos, now):
 
     # still 'open'/'unknown' -- check timeout
     placed_at = pos.get('order_placed_at')
+    if placed_at:
+        if isinstance(placed_at, str):
+            try:
+                placed_at = datetime.fromisoformat(placed_at)
+            except ValueError:
+                placed_at = None
     if placed_at and (now - placed_at).total_seconds() > PENDING_FILL_TIMEOUT_MINUTES * 60:
         cancel_order(SYMBOL, pos['buy_order_id'])
         return 'gave_up'
@@ -183,6 +201,24 @@ def process_pending_fill(pos, now):
 
 
 def open_position_with_limit_buy(entry_price, take_profit, stop_loss, now, label):
+    """
+    Places the limit buy and returns a position dict.
+
+    If the real order succeeds, the position starts in 'pending_fill'
+    status and gets confirmed/promoted to 'open' (plus a real OCO
+    sell placed) once process_pending_fill() sees it close.
+
+    If the real order FAILS (e.g. insufficient balance on THIS bot's
+    own account), the position is still tracked -- immediately as
+    'open', with base_amount=0 and virtual=True. The bot's purpose is
+    to generate and announce signals; other traders act on them
+    independently of whether this bot's own account could fill the
+    order. A virtual position still goes through the normal TP/SL
+    candle check, still sends a close notification, and still gets
+    removed from open_positions/DB when it closes -- there's just no
+    real OCO protection and no real sell attempted for it (nothing to
+    sell on this account).
+    """
     now_iso = now.isoformat() if isinstance(now, datetime) else now
     opened_at_str = now.strftime('%H:%M') if isinstance(now, datetime) else now
 
@@ -205,16 +241,12 @@ def open_position_with_limit_buy(entry_price, take_profit, stop_loss, now, label
         buy_result = place_limit_buy(SYMBOL, entry_price, QUOTE_AMOUNT_PER_TRADE)
         pos['buy_order_id'] = buy_result.get('id')
         pos['base_amount']  = buy_result.get('filled_amount')
-        
-        # If dry run returned 'closed' right away, promote directly to open
-        if buy_result.get('status') == 'closed':
-            pos['status'] = 'open'
-            
         return pos
 
     except Exception as e:
-        # On order failure, mark as virtual and ensure status is set to 'open'
-        # so the candle check loop evaluates its TP/SL properly.
+        # This bot's own order failed -- track the signal anyway so
+        # subscribers following it still get a close notification when
+        # TP/SL is hit. No real holdings, no OCO, just signal tracking.
         pos['status']  = 'open'
         pos['virtual'] = True
         pos['error']   = str(e)
@@ -223,7 +255,7 @@ def open_position_with_limit_buy(entry_price, take_profit, stop_loss, now, label
                      f"({e}) — tracking signal anyway for subscribers")
         print(f"[{SYMBOL}] Order placement failed, tracking as virtual: {e}")
         return pos
-    
+
 
 def run_bot(model, scaler, encoder, barrier_model=None, barrier_scaler=None, barrier_encoder=None):
     saved_positions, saved_trades, saved_pnl, saved_day = load_bot_state(SYMBOL)
@@ -319,6 +351,7 @@ def run_bot(model, scaler, encoder, barrier_model=None, barrier_scaler=None, bar
             # ONE non-blocking check per position per tick -- no waiting.
             # Virtual positions (status already 'open') pass straight
             # through untouched.
+            state_changed = False
             still_pending_positions = []
             for pos in open_positions:
                 if pos.get('status') != 'pending_fill':
@@ -334,9 +367,11 @@ def run_bot(model, scaler, encoder, barrier_model=None, barrier_scaler=None, bar
                     send_message(f"⏱️ <b>[{SYMBOL}] Limit buy never filled, canceled</b>\n"
                                  f"Target entry: {pos['entry']}")
                     daily_trades = max(0, daily_trades - 1)  # give the slot back
+                    state_changed = True
                     # not added to still_pending_positions -> effectively removed
                 elif outcome == 'filled':
                     print(f"[{SYMBOL}] ✅ Limit buy filled @ {pos['entry']} — placing OCO")
+                    state_changed = True
                     try:
                         oco_result = place_oco_sell(
                             SYMBOL, pos['base_amount'], pos['take_profit'], pos['stop_loss']
@@ -356,20 +391,17 @@ def run_bot(model, scaler, encoder, barrier_model=None, barrier_scaler=None, bar
 
             open_positions = still_pending_positions
 
-            # ── Step 2: check OPEN positions' TP/SL via candle high/low ──
-            # Applies to both real (OCO-backed) and virtual (signal-only)
-            # positions equally -- this is what updates our own records/
-            # cooldowns/daily_pnl and sends the close notification. The
-            # OCO (when present) is the actual execution guarantee on the
-            # exchange; this is the bookkeeping + subscriber notification.
+            # ── Step 2: check TP/SL via candle high/low ──────────
+            # Applies to every position that is NOT still waiting for its
+            # buy to fill: real (OCO-backed) and virtual (signal-only)
+            # alike, plus any unexpected/legacy status so a position can
+            # never get stuck unmanaged. This is what updates our own
+            # records/cooldowns/daily_pnl and sends the close notification.
+            # The OCO (when present) is the actual execution guarantee on
+            # the exchange; this is the bookkeeping + subscriber notification.
             closed_positions = []
             for pos in open_positions:
-                # Allow evaluation if the position is marked 'open' OR if it's a virtual fallback tracking record
-                if pos['action'] != 'BUY':
-                    continue
-                    
-                status = pos.get('status')
-                if status != 'open' and not pos.get('virtual'):
+                if pos.get('status') == 'pending_fill' or pos['action'] != 'BUY':
                     continue
 
                 if candle_high >= pos['take_profit']:
@@ -386,8 +418,7 @@ def run_bot(model, scaler, encoder, barrier_model=None, barrier_scaler=None, bar
 
             for pos in closed_positions:
                 open_positions.remove(pos)
-
-            if closed_positions or still_pending_positions != open_positions:
+            if closed_positions or state_changed:
                 save_bot_state(SYMBOL, open_positions, daily_trades, daily_pnl, last_day)
 
             # ── Step 3: Pyramiding ──────────────────────────────
@@ -434,7 +465,8 @@ def run_bot(model, scaler, encoder, barrier_model=None, barrier_scaler=None, bar
                             f"🛑 SL:    <b>{new_sl}</b>\n"
                             f"📊 {reason}"
                         )
-                        save_bot_state(SYMBOL, open_positions, daily_trades, daily_pnl, last_day)
+                    # Always persist: pos['pyramided'] changed even if no entry was made
+                    save_bot_state(SYMBOL, open_positions, daily_trades, daily_pnl, last_day)
                     break
 
         except Exception as e:

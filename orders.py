@@ -75,7 +75,8 @@ def _get_exchange():
 
 
 def get_available_balance(asset: str) -> float:
-    """Returns available free balance for asset (e.g., 'USDT')."""
+    """Returns available free balance for a single asset (e.g., 'USDT').
+    Pass the bare asset code, NOT a trading pair like 'ZEC/USDT'."""
     if DRY_RUN:
         return 10000.0  # Simulated balance
     exchange = _get_exchange()
@@ -89,11 +90,11 @@ def place_limit_buy(symbol: str, limit_price: float, quote_amount: float) -> dic
     for it to fill. Check fill status later with check_order_status().
     """
     exchange = _get_exchange()
-    
-    # Extract quote currency (e.g., 'USDT' from 'ZEC/USDT')
-    quote_asset = symbol.split('/')[1] if '/' in symbol else 'USDT'
 
     if not DRY_RUN:
+        # A buy spends the QUOTE asset (USDT in 'ZEC/USDT'), so that is
+        # the balance to check -- not the trading pair string itself.
+        quote_asset = symbol.split('/')[1]
         balance = get_available_balance(quote_asset)
         if balance < quote_amount:
             raise RuntimeError(
