@@ -183,24 +183,6 @@ def process_pending_fill(pos, now):
 
 
 def open_position_with_limit_buy(entry_price, take_profit, stop_loss, now, label):
-    """
-    Places the limit buy and returns a position dict.
-
-    If the real order succeeds, the position starts in 'pending_fill'
-    status and gets confirmed/promoted to 'open' (plus a real OCO
-    sell placed) once process_pending_fill() sees it close.
-
-    If the real order FAILS (e.g. insufficient balance on THIS bot's
-    own account), the position is still tracked -- immediately as
-    'open', with base_amount=0 and virtual=True. The bot's purpose is
-    to generate and announce signals; other traders act on them
-    independently of whether this bot's own account could fill the
-    order. A virtual position still goes through the normal TP/SL
-    candle check, still sends a close notification, and still gets
-    removed from open_positions/DB when it closes -- there's just no
-    real OCO protection and no real sell attempted for it (nothing to
-    sell on this account).
-    """
     now_iso = now.isoformat() if isinstance(now, datetime) else now
     opened_at_str = now.strftime('%H:%M') if isinstance(now, datetime) else now
 
@@ -223,12 +205,16 @@ def open_position_with_limit_buy(entry_price, take_profit, stop_loss, now, label
         buy_result = place_limit_buy(SYMBOL, entry_price, QUOTE_AMOUNT_PER_TRADE)
         pos['buy_order_id'] = buy_result.get('id')
         pos['base_amount']  = buy_result.get('filled_amount')
+        
+        # If dry run returned 'closed' right away, promote directly to open
+        if buy_result.get('status') == 'closed':
+            pos['status'] = 'open'
+            
         return pos
 
     except Exception as e:
-        # This bot's own order failed -- track the signal anyway so
-        # subscribers following it still get a close notification when
-        # TP/SL is hit. No real holdings, no OCO, just signal tracking.
+        # On order failure, mark as virtual and ensure status is set to 'open'
+        # so the candle check loop evaluates its TP/SL properly.
         pos['status']  = 'open'
         pos['virtual'] = True
         pos['error']   = str(e)
@@ -237,7 +223,7 @@ def open_position_with_limit_buy(entry_price, take_profit, stop_loss, now, label
                      f"({e}) — tracking signal anyway for subscribers")
         print(f"[{SYMBOL}] Order placement failed, tracking as virtual: {e}")
         return pos
-
+    
 
 def run_bot(model, scaler, encoder, barrier_model=None, barrier_scaler=None, barrier_encoder=None):
     saved_positions, saved_trades, saved_pnl, saved_day = load_bot_state(SYMBOL)
@@ -378,7 +364,12 @@ def run_bot(model, scaler, encoder, barrier_model=None, barrier_scaler=None, bar
             # exchange; this is the bookkeeping + subscriber notification.
             closed_positions = []
             for pos in open_positions:
-                if pos.get('status') != 'open' or pos['action'] != 'BUY':
+                # Allow evaluation if the position is marked 'open' OR if it's a virtual fallback tracking record
+                if pos['action'] != 'BUY':
+                    continue
+                    
+                status = pos.get('status')
+                if status != 'open' and not pos.get('virtual'):
                     continue
 
                 if candle_high >= pos['take_profit']:
@@ -395,6 +386,7 @@ def run_bot(model, scaler, encoder, barrier_model=None, barrier_scaler=None, bar
 
             for pos in closed_positions:
                 open_positions.remove(pos)
+
             if closed_positions or still_pending_positions != open_positions:
                 save_bot_state(SYMBOL, open_positions, daily_trades, daily_pnl, last_day)
 

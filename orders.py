@@ -90,12 +90,15 @@ def place_limit_buy(symbol: str, limit_price: float, quote_amount: float) -> dic
     """
     exchange = _get_exchange()
     
+    # Extract quote currency (e.g., 'USDT' from 'ZEC/USDT')
+    quote_asset = symbol.split('/')[1] if '/' in symbol else 'USDT'
+
     if not DRY_RUN:
-        balance = get_available_balance(symbol)
+        balance = get_available_balance(quote_asset)
         if balance < quote_amount:
             raise RuntimeError(
-                f"Insufficient balance: {balance:.2f} {symbol} available, "
-                f"{quote_amount:.2f} {symbol} required."
+                f"Insufficient balance: {balance:.2f} {quote_asset} available, "
+                f"{quote_amount:.2f} {quote_asset} required."
             )
 
     formatted_price = float(exchange.price_to_precision(symbol, limit_price)) if not DRY_RUN else limit_price
