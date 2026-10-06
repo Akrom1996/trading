@@ -183,50 +183,65 @@ def cancel_order(symbol: str, order_id: str) -> bool:
 
 def place_oco_sell(symbol: str, base_amount: float, tp_price: float, sl_price: float) -> dict:
     """
-    Places an OCO (One-Cancels-the-Other) sell order on Binance so TP
-    and SL are enforced by the exchange itself, not by this bot polling
-    price. Call this ONLY after confirming the buy actually filled
-    (via check_order_status returning 'closed').
+    Places an OCO sell on Binance via the raw endpoint (ccxt has no
+    unified 'OCO' order type). Call ONLY after the buy is confirmed filled.
     """
     exchange = _get_exchange()
 
-    formatted_amount = exchange.amount_to_precision(symbol, base_amount) if not DRY_RUN else round(base_amount, 6)
-    formatted_tp = exchange.price_to_precision(symbol, tp_price) if not DRY_RUN else tp_price
-    formatted_sl_trigger = exchange.price_to_precision(symbol, sl_price) if not DRY_RUN else sl_price
-
-    sl_limit_price = sl_price * 0.998  # small buffer so the SL leg fills even in a fast drop
-    formatted_sl_limit = exchange.price_to_precision(symbol, sl_limit_price) if not DRY_RUN else sl_limit_price
+    sl_limit_price = sl_price * 0.998  # buffer so the SL leg fills in a fast drop
 
     if DRY_RUN:
-        print(f"[orders] 🧪 DRY_RUN OCO Sell set: {formatted_amount} {symbol.split('/')[0]}")
-        print(f"         Target TP: {formatted_tp} | Target SL Trigger: {formatted_sl_trigger}")
+        print(f"[orders] 🧪 DRY_RUN OCO Sell set: {round(base_amount, 6)} {symbol.split('/')[0]}")
+        print(f"         Target TP: {tp_price} | Target SL Trigger: {sl_price}")
         return {
-            'id': 'dry-run-oco-sell',
-            'symbol': symbol,
-            'filled_amount': formatted_amount,
-            'take_profit': formatted_tp,
-            'stop_loss': formatted_sl_trigger,
-            'dry_run': True,
-            'status': 'open',
+            'id': 'dry-run-oco-sell', 'symbol': symbol,
+            'filled_amount': round(base_amount, 6),
+            'take_profit': tp_price, 'stop_loss': sl_price,
+            'dry_run': True, 'status': 'open',
         }
 
-    # NOTE: ccxt's support for Binance OCO orders varies by version --
-    # some versions accept type='oco' via create_order, others need a
-    # dedicated method. TEST THIS SPECIFIC CALL against testnet by
-    # itself before relying on it live; if it errors, check your ccxt
-    # version's docs for the current OCO calling convention.
-    order = exchange.create_order(
-        symbol=symbol, type='OCO', side='sell',
-        amount=formatted_amount, price=formatted_tp,
-        params={
-            'stopPrice': formatted_sl_trigger,
-            'stopLimitPrice': formatted_sl_limit,
+    # Buy fees are often taken from the base coin, so the free balance can
+    # be slightly below the filled amount. Never ask to sell more than we hold.
+    base_asset = symbol.split('/')[0]
+    free_base = get_available_balance(base_asset)
+    sell_amount = min(base_amount, free_base) if free_base > 0 else base_amount
+
+    market = exchange.market(symbol)
+    qty   = exchange.amount_to_precision(symbol, sell_amount)
+    tp    = exchange.price_to_precision(symbol, tp_price)
+    sl_tr = exchange.price_to_precision(symbol, sl_price)
+    sl_lm = exchange.price_to_precision(symbol, sl_limit_price)
+
+    # New endpoint: POST /api/v3/orderList/oco
+    new_params = {
+        'symbol': market['id'],
+        'side': 'SELL',
+        'quantity': qty,
+        'aboveType': 'LIMIT_MAKER',          # take-profit leg
+        'abovePrice': tp,
+        'belowType': 'STOP_LOSS_LIMIT',      # stop-loss leg
+        'belowStopPrice': sl_tr,
+        'belowPrice': sl_lm,
+        'belowTimeInForce': 'GTC',
+    }
+    new_fn = (getattr(exchange, 'private_post_orderlist_oco', None)
+              or getattr(exchange, 'privatePostOrderListOco', None))
+
+    if new_fn is not None:
+        order = new_fn(new_params)
+    else:
+        # Older ccxt without the new endpoint: legacy OCO call
+        old_fn = (getattr(exchange, 'private_post_order_oco', None)
+                  or getattr(exchange, 'privatePostOrderOco'))
+        order = old_fn({
+            'symbol': market['id'], 'side': 'SELL', 'quantity': qty,
+            'price': tp, 'stopPrice': sl_tr, 'stopLimitPrice': sl_lm,
             'stopLimitTimeInForce': 'GTC',
-        }
-    )
-    print(f"[orders] 🎯 LIVE OCO Sell Order set for {symbol}: TP @ {formatted_tp} | SL @ {formatted_sl_trigger}")
-    return order
+        })
 
+    print(f"[orders] 🎯 LIVE OCO Sell set for {symbol}: TP @ {tp} | SL @ {sl_tr} "
+          f"(orderListId: {order.get('orderListId')})")
+    return order
 
 def place_market_buy(symbol: str, quote_amount: float, tp_price: float = None, sl_price: float = None) -> dict:
     """Market buy for instant fills (no offset, no wait)."""

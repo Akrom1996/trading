@@ -65,11 +65,11 @@ services:
     restart: unless-stopped
     mem_limit: 512m
 
-  bot-iota:
+  bot-orca:
     build: .
-    container_name: bot-iota
+    container_name: bot-orca
     environment:
-      - SYMBOL=IOTA/USDT
+      - SYMBOL=ORCA/USDT
       - DB_PATH=/app/data/bot_data.db
     env_file:
       - .env
