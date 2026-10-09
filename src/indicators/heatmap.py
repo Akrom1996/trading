@@ -1,17 +1,6 @@
 """
-Free replacement for the Coinglass-based liquidation module.
-
-Data source: Binance USDS-M Futures public `forceOrder` WebSocket stream.
-No API key needed -- this is public market data.
-
-Note: Binance deprecated the public REST endpoint for market-wide
-liquidation history (GET /fapi/v1/allForceOrders no longer accepts
-requests), so there is no second live REST source to fall back to.
-Resilience here comes from auto-reconnect + an in-memory rolling
-window, not from a second data provider.
-
-Install dependency:
-    pip install websocket-client
+Liquidation heatmap and real-time liquidation cluster parser.
+Data source: Binance USDS-M Futures public forceOrder WebSocket stream.
 """
 
 import json
@@ -19,27 +8,30 @@ import threading
 import time
 from collections import deque
 from datetime import datetime, timedelta
+from typing import Optional, Dict, Any, List, Tuple
 
-import websocket  # pip install websocket-client
+try:
+    import websocket
+except ImportError:
+    websocket = None
 
 BINANCE_WS_BASE = "wss://fstream.binance.com/ws"
-_MAX_EVENTS = 500  # rolling window of recent liquidation events per symbol
+_MAX_EVENTS = 500
 
 
 def _normalize_symbol(symbol: str) -> str:
-    """Accepts 'ETH' or 'ETHUSDT' and returns the Binance futures symbol."""
-    symbol = symbol.upper()
-    return symbol if symbol.endswith("USDT") else f"{symbol}USDT"
+    """Accepts 'SOL', 'SOL/USDT' or 'SOLUSDT' and returns the Binance futures symbol."""
+    s = symbol.upper().replace('/', '')
+    return s if s.endswith("USDT") else f"{s}USDT"
 
 
 class LiquidationTracker:
     """
-    Maintains a rolling window of real liquidation events for ETH symbol,
-    fed by Binance's public forceOrder websocket stream. Runs in a
-    background thread and auto-reconnects with exponential backoff.
+    Maintains a rolling window of real liquidation events per symbol,
+    fed by Binance's public forceOrder websocket stream. Auto-reconnects with exponential backoff.
     """
 
-    def __init__(self, symbol="ETHUSDT"):
+    def __init__(self, symbol: str = "SOLUSDT"):
         self.symbol = _normalize_symbol(symbol)
         self.events = deque(maxlen=_MAX_EVENTS)
         self.lock = threading.Lock()
@@ -58,7 +50,6 @@ class LiquidationTracker:
         if self.ws:
             self.ws.close()
 
-    # ── internal websocket plumbing ──────────────────────
     def _run_forever(self):
         backoff = 1
         while not self._stop:
@@ -71,36 +62,33 @@ class LiquidationTracker:
                     on_close=self._on_close,
                     on_error=self._on_error,
                 )
-                backoff = 1  # reset backoff after a run_forever attempt starts
+                backoff = 1
                 self.ws.run_forever(ping_interval=20, ping_timeout=10)
             except Exception as e:
-                print(f"[liq:{self.symbol}] websocket crashed: {e}")
+                print(f"[heatmap:{self.symbol}] websocket error: {e}")
 
             if self._stop:
                 break
-            print(f"[liq:{self.symbol}] reconnecting in {backoff}s...")
             time.sleep(backoff)
             backoff = min(backoff * 2, 60)
 
     def _on_open(self, ws):
         self.connected = True
-        print(f"[liq:{self.symbol}] connected")
+        print(f"[heatmap:{self.symbol}] connected")
 
     def _on_close(self, ws, code, msg):
         self.connected = False
-        print(f"[liq:{self.symbol}] disconnected ({code}: {msg})")
+        print(f"[heatmap:{self.symbol}] disconnected ({code}: {msg})")
 
     def _on_error(self, ws, error):
-        print(f"[liq:{self.symbol}] error: {error}")
+        print(f"[heatmap:{self.symbol}] error: {error}")
 
     def _on_message(self, ws, message):
         try:
             o = json.loads(message)["o"]
             event = {
                 "time": datetime.fromtimestamp(o["T"] / 1000),
-                # SELL forceOrder = a long position got liquidated
-                # BUY  forceOrder = a short position got liquidated
-                "side": o["S"],
+                "side": o["S"],  # SELL = long liquidated, BUY = short liquidated
                 "price": float(o["ap"]),
                 "qty": float(o["z"]),
                 "notional": float(o["ap"]) * float(o["z"]),
@@ -109,17 +97,15 @@ class LiquidationTracker:
                 self.events.append(event)
                 self.last_event_at = event["time"]
         except Exception as e:
-            print(f"[liq:{self.symbol}] parse error: {e}")
+            print(f"[heatmap:{self.symbol}] parse error: {e}")
 
-    # ── public read access ────────────────────────────────
-    def snapshot(self, window_minutes=60):
+    def snapshot(self, window_minutes: int = 60) -> List[Dict[str, Any]]:
         cutoff = datetime.now() - timedelta(minutes=window_minutes)
         with self.lock:
             return [e for e in self.events if e["time"] >= cutoff]
 
 
-# ── analysis (mirrors the old Coinglass-based logic) ──────
-def analyze_liquidations(tracker: LiquidationTracker, window_minutes=60):
+def analyze_liquidations(tracker: LiquidationTracker, window_minutes: int = 60) -> Optional[Dict[str, Any]]:
     recent = tracker.snapshot(window_minutes)
     if not recent:
         return None
@@ -137,7 +123,7 @@ def analyze_liquidations(tracker: LiquidationTracker, window_minutes=60):
         bias, comment = "NEUTRAL", "Balanced liquidations — no clear bias"
 
     events_per_min = len(recent) / max(window_minutes, 1)
-    liq_spike = events_per_min > 2  # tune threshold to taste per symbol
+    liq_spike = events_per_min > 2
 
     return {
         "bias": bias,
@@ -151,13 +137,14 @@ def analyze_liquidations(tracker: LiquidationTracker, window_minutes=60):
     }
 
 
-def get_liq_levels(tracker: LiquidationTracker, current_price=None,
-                    window_minutes=180, cluster_pct=0.3):
+def get_liq_levels(
+    tracker: LiquidationTracker,
+    current_price: Optional[float] = None,
+    window_minutes: int = 180,
+    cluster_pct: float = 0.3,
+) -> List[Dict[str, Any]]:
     """
-    Approximates liquidation "zones" by clustering actual recent
-    liquidation prices. This is NOT a predictive heatmap like Coinglass's
-    (which models future liquidation risk from inferred open positions) --
-    it only reflects where liquidations have already happened recently.
+    Approximates liquidation zones by clustering recent liquidation prices.
     """
     if not current_price:
         return []
@@ -166,7 +153,7 @@ def get_liq_levels(tracker: LiquidationTracker, current_price=None,
     if not events:
         return []
 
-    clusters = []
+    clusters: List[Dict[str, Any]] = []
     for e in sorted(events, key=lambda x: x["price"]):
         placed = False
         for c in clusters:
@@ -191,12 +178,11 @@ def get_liq_levels(tracker: LiquidationTracker, current_price=None,
     return sorted(nearby, key=lambda x: x["distance"])[:5]
 
 
-# ── main entry point — call this from start.py ─────────────
-_trackers = {}
+_trackers: Dict[str, LiquidationTracker] = {}
 _tracker_lock = threading.Lock()
 
 
-def _get_tracker(symbol: str) -> LiquidationTracker:
+def get_tracker(symbol: str) -> LiquidationTracker:
     key = _normalize_symbol(symbol)
     with _tracker_lock:
         if key not in _trackers:
@@ -204,18 +190,12 @@ def _get_tracker(symbol: str) -> LiquidationTracker:
         return _trackers[key]
 
 
-def get_liq_data(symbol='ETH', current_price=None):
+def get_liq_data(symbol: str = 'SOL', current_price: Optional[float] = None) -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]]]:
     """
-    Drop-in replacement for the old Coinglass-based get_liq_data().
-    Returns (liq_analysis_dict_or_None, levels_list).
-
-    Backed by a live Binance forceOrder websocket instead of a paid API.
-    The tracker is created once per symbol and kept running in the
-    background across calls, so repeated calls are cheap.
+    Returns liquidation analysis and nearby liquidation clusters.
     """
-    tracker = _get_tracker(symbol)
+    tracker = get_tracker(symbol)
 
-    # give the socket a moment to connect on the very first call
     waited = 0.0
     while not tracker.connected and waited < 5:
         time.sleep(0.5)

@@ -1,79 +1,136 @@
 version: '3.8'
 
 services:
+  redis:
+    image: redis:7-alpine
+    container_name: trading-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    mem_limit: 128m
+    command: redis-server --save "" --appendonly no
+
+  btc-analyzer:
+    build: .
+    container_name: btc-analyzer
+    command: python -u main.py --role btc_analyzer
+    environment:
+      - ROLE=btc_analyzer
+      - SYMBOL=BTC/USDT
+      - REDIS_URL=redis://redis:6379/0
+      - DB_PATH=/app/data/bot_data.db
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+    depends_on:
+      - redis
+    restart: unless-stopped
+    mem_limit: 400m
+    memswap_limit: 800m
+
   bot-sol:
     build: .
     container_name: bot-sol
     environment:
       - SYMBOL=SOL/USDT
+      - ROLE=coin_trader
+      - REDIS_URL=redis://redis:6379/0
       - DB_PATH=/app/data/bot_data.db
     env_file:
-      - .env   # TELEGRAM_TOKEN, BINANCE keys, etc -- shared secrets
+      - .env
     volumes:
       - ./data:/app/data
+    depends_on:
+      - redis
     restart: unless-stopped
-    mem_limit: 512m
+    mem_limit: 600m
+    memswap_limit: 1200m
 
   bot-zec:
     build: .
     container_name: bot-zec
     environment:
       - SYMBOL=ZEC/USDT
+      - ROLE=coin_trader
+      - REDIS_URL=redis://redis:6379/0
       - DB_PATH=/app/data/bot_data.db
     env_file:
       - .env
     volumes:
       - ./data:/app/data
+    depends_on:
+      - redis
     restart: unless-stopped
-    mem_limit: 512m
+    mem_limit: 600m
+    memswap_limit: 1200m
 
-  bot-dash:
-    build: .
-    container_name: bot-dash
-    environment:
-      - SYMBOL=DASH/USDT
-      - DB_PATH=/app/data/bot_data.db
-    env_file:
-      - .env
-    volumes:
-      - ./data:/app/data
-    restart: unless-stopped
-    mem_limit: 512m
+  # bot-dash:
+  #   build: .
+  #   container_name: bot-dash
+  #   environment:
+  #     - SYMBOL=DASH/USDT
+  #     - ROLE=coin_trader
+  #     - REDIS_URL=redis://redis:6379/0
+  #     - DB_PATH=/app/data/bot_data.db
+  #   env_file:
+  #     - .env
+  #   volumes:
+  #     - ./data:/app/data
+  #   depends_on:
+  #     - redis
+  #   restart: unless-stopped
+  #   mem_limit: 600m
+  #   memswap_limit: 1200m
 
-  # Dedicated automated daily report service
-  daily-reporter:
-    build: .
-    command: python reporter_service.py
-    environment:
-      - DB_PATH=/app/data/bot_data.db
-    env_file:
-      - .env
-    volumes:
-      - ./data:/app/data
-    restart: always
-    
-  bot-qnt:
-    build: .
-    container_name: bot-qnt
-    environment:
-      - SYMBOL=QNT/USDT
-      - DB_PATH=/app/data/bot_data.db
-    env_file:
-      - .env
-    volumes:
-      - ./data:/app/data
-    restart: unless-stopped
-    mem_limit: 512m
+  # bot-qnt:
+  #   build: .
+  #   container_name: bot-qnt
+  #   environment:
+  #     - SYMBOL=QNT/USDT
+  #     - ROLE=coin_trader
+  #     - REDIS_URL=redis://redis:6379/0
+  #     - DB_PATH=/app/data/bot_data.db
+  #   env_file:
+  #     - .env
+  #   volumes:
+  #     - ./data:/app/data
+  #   depends_on:
+  #     - redis
+  #   restart: unless-stopped
+  #   mem_limit: 600m
+  #   memswap_limit: 1200m
 
-  bot-orca:
-    build: .
-    container_name: bot-orca
-    environment:
-      - SYMBOL=ORCA/USDT
-      - DB_PATH=/app/data/bot_data.db
-    env_file:
-      - .env
-    volumes:
-      - ./data:/app/data
-    restart: unless-stopped
-    mem_limit: 512m
+  # bot-orca:
+  #   build: .
+  #   container_name: bot-orca
+  #   environment:
+  #     - SYMBOL=ORCA/USDT
+  #     - ROLE=coin_trader
+  #     - REDIS_URL=redis://redis:6379/0
+  #     - DB_PATH=/app/data/bot_data.db
+  #   env_file:
+  #     - .env
+  #   volumes:
+  #     - ./data:/app/data
+  #   depends_on:
+  #     - redis
+  #   restart: unless-stopped
+  #   mem_limit: 600m
+  #   memswap_limit: 1200m
+
+  # daily-reporter:
+  #   build: .
+  #   container_name: trading-daily-reporter-1
+  #   command: python -u main.py --role reporter
+  #   environment:
+  #     - DB_PATH=/app/data/bot_data.db
+  #     - REDIS_URL=redis://redis:6379/0
+  #   env_file:
+  #     - .env
+  #   volumes:
+  #     - ./data:/app/data
+  #   depends_on:
+  #     - redis
+  #   restart: always
+  #   mem_limit: 256m
