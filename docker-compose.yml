@@ -65,72 +65,72 @@ services:
     mem_limit: 600m
     memswap_limit: 1200m
 
-  # bot-dash:
-  #   build: .
-  #   container_name: bot-dash
-  #   environment:
-  #     - SYMBOL=DASH/USDT
-  #     - ROLE=coin_trader
-  #     - REDIS_URL=redis://redis:6379/0
-  #     - DB_PATH=/app/data/bot_data.db
-  #   env_file:
-  #     - .env
-  #   volumes:
-  #     - ./data:/app/data
-  #   depends_on:
-  #     - redis
-  #   restart: unless-stopped
-  #   mem_limit: 600m
-  #   memswap_limit: 1200m
+  bot-dash:
+    build: .
+    container_name: bot-dash
+    environment:
+      - SYMBOL=DASH/USDT
+      - ROLE=coin_trader
+      - REDIS_URL=redis://redis:6379/0
+      - DB_PATH=/app/data/bot_data.db
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+    depends_on:
+      - redis
+    restart: unless-stopped
+    mem_limit: 600m
+    memswap_limit: 1200m
 
-  # bot-qnt:
-  #   build: .
-  #   container_name: bot-qnt
-  #   environment:
-  #     - SYMBOL=QNT/USDT
-  #     - ROLE=coin_trader
-  #     - REDIS_URL=redis://redis:6379/0
-  #     - DB_PATH=/app/data/bot_data.db
-  #   env_file:
-  #     - .env
-  #   volumes:
-  #     - ./data:/app/data
-  #   depends_on:
-  #     - redis
-  #   restart: unless-stopped
-  #   mem_limit: 600m
-  #   memswap_limit: 1200m
+  bot-qnt:
+    build: .
+    container_name: bot-qnt
+    environment:
+      - SYMBOL=QNT/USDT
+      - ROLE=coin_trader
+      - REDIS_URL=redis://redis:6379/0
+      - DB_PATH=/app/data/bot_data.db
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+    depends_on:
+      - redis
+    restart: unless-stopped
+    mem_limit: 600m
+    memswap_limit: 1200m
 
-  # bot-orca:
-  #   build: .
-  #   container_name: bot-orca
-  #   environment:
-  #     - SYMBOL=ORCA/USDT
-  #     - ROLE=coin_trader
-  #     - REDIS_URL=redis://redis:6379/0
-  #     - DB_PATH=/app/data/bot_data.db
-  #   env_file:
-  #     - .env
-  #   volumes:
-  #     - ./data:/app/data
-  #   depends_on:
-  #     - redis
-  #   restart: unless-stopped
-  #   mem_limit: 600m
-  #   memswap_limit: 1200m
+  bot-orca:
+    build: .
+    container_name: bot-orca
+    environment:
+      - SYMBOL=ORCA/USDT
+      - ROLE=coin_trader
+      - REDIS_URL=redis://redis:6379/0
+      - DB_PATH=/app/data/bot_data.db
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+    depends_on:
+      - redis
+    restart: unless-stopped
+    mem_limit: 600m
+    memswap_limit: 1200m
 
-  # daily-reporter:
-  #   build: .
-  #   container_name: trading-daily-reporter-1
-  #   command: python -u main.py --role reporter
-  #   environment:
-  #     - DB_PATH=/app/data/bot_data.db
-  #     - REDIS_URL=redis://redis:6379/0
-  #   env_file:
-  #     - .env
-  #   volumes:
-  #     - ./data:/app/data
-  #   depends_on:
-  #     - redis
-  #   restart: always
-  #   mem_limit: 256m
+  daily-reporter:
+    build: .
+    container_name: trading-daily-reporter-1
+    command: python -u main.py --role reporter
+    environment:
+      - DB_PATH=/app/data/bot_data.db
+      - REDIS_URL=redis://redis:6379/0
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+    depends_on:
+      - redis
+    restart: always
+    mem_limit: 256m
