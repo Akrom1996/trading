@@ -139,7 +139,7 @@ class TelegramNotifier:
             f"⚡ 1h RSI:      <b>{regime_data.get('rsi_1h', 0):.1f}</b>\n"
             f"📊 Order Book:  <b>{regime_data.get('ob_bias', 'N/A')} ({regime_data.get('imbalance', 0):+.1%})</b>"
         )
-        self.send_message(msg)
+        self.send_message(msg, self.error_chat_id)
 
 
 # ── Global Default Notifier & Functional API ─────────────────────
