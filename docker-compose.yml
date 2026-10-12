@@ -29,11 +29,11 @@ services:
     mem_limit: 400m
     memswap_limit: 800m
 
-  bot-sol:
+  bot-near:
     build: .
-    container_name: bot-sol
+    container_name: bot-near
     environment:
-      - SYMBOL=SOL/USDT
+      - SYMBOL=NEAR/USDT
       - ROLE=coin_trader
       - REDIS_URL=redis://redis:6379/0
       - DB_PATH=/app/data/bot_data.db
@@ -65,11 +65,11 @@ services:
     mem_limit: 600m
     memswap_limit: 1200m
 
-  bot-dash:
+  bot-chip:
     build: .
-    container_name: bot-dash
+    container_name: bot-chip
     environment:
-      - SYMBOL=DASH/USDT
+      - SYMBOL=CHIP/USDT
       - ROLE=coin_trader
       - REDIS_URL=redis://redis:6379/0
       - DB_PATH=/app/data/bot_data.db
