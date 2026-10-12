@@ -26,7 +26,7 @@ except ImportError:
 from config.settings import settings
 
 # ── Fibonacci Tiers & Horizons ─────────────────────────────────
-FIBONACCI_LEVELS = [0.01, 0.02, 0.03, 0.05, 0.08, 0.13]
+FIBONACCI_LEVELS = [0.01, 0.02, 0.03, 0.05, 0.08]
 
 FIB_TIER_NAMES = {
     0: "NEUTRAL / CHOP (<1%)",
@@ -34,8 +34,7 @@ FIB_TIER_NAMES = {
     2: "FIB_2 (+2%)",
     3: "FIB_3 (+3%)",
     4: "FIB_5 (+5%)",
-    5: "FIB_8 (+8%)",
-    6: "FIB_13 (+13%)",
+    5: "FIB_8 (+8%+)",
 }
 
 TIER_TO_PCT = {
@@ -45,7 +44,6 @@ TIER_TO_PCT = {
     3: 0.03,
     4: 0.05,
     5: 0.08,
-    6: 0.13,
 }
 
 LABEL_HORIZON_CANDLES = 144
@@ -60,8 +58,7 @@ LABEL_FIB_2 = 2
 LABEL_FIB_3 = 3
 LABEL_FIB_5 = 4
 LABEL_FIB_8 = 5
-LABEL_FIB_13 = 6
-LABEL_TIMEOUT = 7
+LABEL_TIMEOUT = 7  # kept at 7 on purpose: old models with class 6 (former FIB_13) fail the label guard and retrain
 LABEL_TP_FIRST = LABEL_FIB_2
 
 LABEL_NAMES = {
@@ -70,8 +67,7 @@ LABEL_NAMES = {
     LABEL_FIB_2: "TP_FIB_2 (+2%)",
     LABEL_FIB_3: "TP_FIB_3 (+3%)",
     LABEL_FIB_5: "TP_FIB_5 (+5%)",
-    LABEL_FIB_8: "TP_FIB_8 (+8%)",
-    LABEL_FIB_13: "TP_FIB_13 (+13%)",
+    LABEL_FIB_8: "TP_FIB_8 (+8%+)",
     LABEL_TIMEOUT: "TIMEOUT",
 }
 
@@ -87,6 +83,12 @@ FEATURE_COLUMNS = [
     'range_15m',
 ]
 FEATURES = FEATURE_COLUMNS
+
+
+def _labels_are_valid(encoder: Any) -> bool:
+    """True if every class the saved encoder knows still exists in the current label set."""
+    valid_labels = set(LABEL_NAMES) | set(FIB_TIER_NAMES)
+    return all(int(c) in valid_labels for c in encoder.classes_)
 
 
 # ── Technical Indicators & Features ─────────────────────────────
@@ -195,9 +197,7 @@ def add_labels(df: pd.DataFrame, horizon: int = LABEL_HORIZON_CANDLES, sl_pct: f
         max_gains[i] = peak_gain
 
         tier = 0
-        if peak_gain >= 0.13:
-            tier = 6
-        elif peak_gain >= 0.08:
+        if peak_gain >= 0.08:
             tier = 5
         elif peak_gain >= 0.05:
             tier = 4
@@ -239,9 +239,7 @@ def label_triple_barrier(df: pd.DataFrame, horizon: int = LABEL_HORIZON_CANDLES,
             if gain > peak_gain:
                 peak_gain = gain
 
-        if peak_gain >= 0.13:
-            label = LABEL_FIB_13
-        elif peak_gain >= 0.08:
+        if peak_gain >= 0.08:
             label = LABEL_FIB_8
         elif peak_gain >= 0.05:
             label = LABEL_FIB_5
@@ -366,6 +364,10 @@ def load_model(symbol: str) -> Tuple[Optional[Any], Optional[Any], Optional[Any]
             print(f"  Feature set changed ({getattr(scaler, 'n_features_in_', '?')} -> {len(FEATURES)}), retraining...")
             return None, None, None, None
 
+        if not _labels_are_valid(encoder):
+            print("  Label set changed, retraining...")
+            return None, None, None, None
+
         return model, scaler, encoder, metadata
     except Exception as e:
         print(f"  Load model error: {e}")
@@ -458,6 +460,9 @@ def load_barrier_model(symbol: str) -> Tuple[Optional[Any], Optional[Any], Optio
         if getattr(scaler, 'n_features_in_', None) != len(FEATURES):
             print(f"  Feature set changed ({getattr(scaler, 'n_features_in_', '?')} -> {len(FEATURES)}), retraining barrier model...")
             return None, None, None, None
+        if not _labels_are_valid(data['encoder']):
+            print("  Label set changed, retraining barrier model...")
+            return None, None, None, None
         return data['model'], data['scaler'], data['encoder'], data
     except Exception:
         return None, None, None, None
@@ -477,17 +482,14 @@ def predict_barrier_probabilities(model: Any, scaler: Any, encoder: Any, df_late
     p_fib_3 = full_probs[LABEL_FIB_3]
     p_fib_5 = full_probs[LABEL_FIB_5]
     p_fib_8 = full_probs[LABEL_FIB_8]
-    p_fib_13 = full_probs[LABEL_FIB_13]
 
-    p_profitable = p_fib_1 + p_fib_2 + p_fib_3 + p_fib_5 + p_fib_8 + p_fib_13
-    p_extended = p_fib_3 + p_fib_5 + p_fib_8 + p_fib_13
+    p_profitable = p_fib_1 + p_fib_2 + p_fib_3 + p_fib_5 + p_fib_8
+    p_extended = p_fib_3 + p_fib_5 + p_fib_8
 
     recommended_tp = 0.02
-    if p_fib_13 >= 0.12:
-        recommended_tp = 0.13
-    elif (p_fib_8 + p_fib_13) >= 0.15:
+    if p_fib_8 >= 0.15:
         recommended_tp = 0.08
-    elif (p_fib_5 + p_fib_8 + p_fib_13) >= 0.20:
+    elif (p_fib_5 + p_fib_8) >= 0.20:
         recommended_tp = 0.05
     elif p_extended >= 0.25:
         recommended_tp = 0.03
@@ -504,7 +506,6 @@ def predict_barrier_probabilities(model: Any, scaler: Any, encoder: Any, df_late
         'p_fib_3': round(p_fib_3, 4),
         'p_fib_5': round(p_fib_5, 4),
         'p_fib_8': round(p_fib_8, 4),
-        'p_fib_13': round(p_fib_13, 4),
         'recommended_tp': recommended_tp,
     }
 
