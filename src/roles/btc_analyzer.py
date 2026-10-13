@@ -130,7 +130,7 @@ class BTCAnalyzer:
         set_shared_value("btc:macro_regime", regime_data, expire_seconds=1800)
         return regime_data
 
-    def run(self, poll_interval_seconds: int = 900):
+    def run(self, poll_interval_seconds: int = 300):
         """
         Runs the BTC macro analyzer daemon loop.
         """
