@@ -12,9 +12,11 @@ import pandas as pd
 
 from config.settings import settings
 from src.exchanges.binance_client import (
+    check_oco,
     fetch_ohlcv,
     fetch_current_price,
     place_limit_buy,
+    place_market_buy,
     place_market_sell,
     place_oco_sell,
     check_order_status,
@@ -118,63 +120,96 @@ def close_position(pos: dict, current_price: float, reason: str, daily_pnl: floa
 
 
 def process_pending_fill(pos: dict, now: datetime, symbol: str) -> str:
-    status_info = check_order_status(symbol, pos['buy_order_id'])
-    status = status_info['status']
+    info = check_order_status(symbol, pos['buy_order_id'])
+    status = info['status']
 
     if status == 'closed':
-        pos['status'] = 'open'
-        pos['base_amount'] = status_info['filled_amount'] or pos.get('base_amount')
-        if status_info['avg_price']:
-            pos['entry'] = status_info['avg_price']
+        apply_fill(pos, info['filled_amount'], info['avg_price'])
         return 'filled'
 
     if status == 'canceled':
+        if info['filled_amount']:                       # partially filled, then canceled
+            apply_fill(pos, info['filled_amount'], info['avg_price'])
+            return 'filled'
         return 'gave_up'
 
+    if pos.get('order_type') == 'market':               # market orders never time out
+        return 'still_pending'
+
     placed_at = pos.get('order_placed_at')
-    if placed_at:
-        if isinstance(placed_at, str):
-            try:
-                placed_at = datetime.fromisoformat(placed_at)
-            except ValueError:
-                placed_at = None
+    if isinstance(placed_at, str):
+        try:
+            placed_at = datetime.fromisoformat(placed_at)
+        except ValueError:
+            placed_at = None
+
     if placed_at and (now - placed_at).total_seconds() > settings.PENDING_FILL_TIMEOUT_MINUTES * 60:
-        cancel_order(symbol, pos['buy_order_id'])
+        if not cancel_order(symbol, pos['buy_order_id']):
+            return 'still_pending'                      # cancel failed, try again next loop
+        info = check_order_status(symbol, pos['buy_order_id'])
+        if info['filled_amount']:                       # partial fill before cancel
+            apply_fill(pos, info['filled_amount'], info['avg_price'])
+            return 'filled'
         return 'gave_up'
 
     return 'still_pending'
 
 
-def open_position_with_limit_buy(entry_price: float, take_profit: float, stop_loss: float, now: datetime, label: str, symbol: str) -> dict:
-    now_iso = now.isoformat() if isinstance(now, datetime) else now
-    opened_at_str = now.strftime('%H:%M') if isinstance(now, datetime) else now
+def apply_fill(pos: dict, filled, avg_price):
+    pos['status'] = 'open'
+    pos['base_amount'] = filled or pos.get('base_amount') or 0.0
+    if avg_price:
+        pos['entry'] = avg_price
+        if pos.get('order_type') == 'market':      # rebase TP/SL on the real fill
+            d = get_decimal_places(avg_price)
+            pos['take_profit'] = round(avg_price * (1 + pos['tp_pct']), d)
+            pos['stop_loss'] = round(avg_price * (1 - pos['sl_pct']), d)
 
+
+def protect_position(pos: dict, symbol: str):
+    try:
+        oco = place_oco_sell(symbol, pos['base_amount'], pos['take_profit'], pos['stop_loss'])
+        pos['oco_order_id'] = oco.get('id') or oco.get('orderListId')
+    except Exception as e:
+        notify_error(f"🚨 [{symbol}] UNPROTECTED POSITION — buy filled but OCO failed: {e}")
+
+
+def open_position(price: float, tp_pct: float, sl_pct: float, now: datetime,
+                  label: str, symbol: str, is_pyramid: bool = False) -> dict:
+    d = get_decimal_places(price)
     pos = {
         'action': 'BUY',
-        'entry': entry_price,
-        'take_profit': take_profit,
-        'stop_loss': stop_loss,
-        'pyramided': False,
+        'entry': price,
+        'take_profit': round(price * (1 + tp_pct), d),
+        'stop_loss': round(price * (1 - sl_pct), d),
+        'tp_pct': tp_pct,
+        'sl_pct': sl_pct,
+        'order_type': 'limit' if is_pyramid else 'market',
+        'pyramided': False,                 # parent gets set to True in Step 3
         'status': 'pending_fill',
         'buy_order_id': None,
-        'order_placed_at': now_iso,
+        'order_placed_at': now.isoformat(),
         'base_amount': 0.0,
         'oco_order_id': None,
         'virtual': False,
-        'opened_at': opened_at_str,
+        'opened_at': now.strftime('%H:%M'),
     }
-
     try:
-        buy_result = place_limit_buy(symbol, entry_price, settings.QUOTE_AMOUNT_PER_TRADE)
-        pos['buy_order_id'] = buy_result.get('id')
-        pos['base_amount'] = buy_result.get('filled_amount')
+        if is_pyramid:
+            res = place_limit_buy(symbol, price, settings.QUOTE_AMOUNT_PER_TRADE)
+            pos['buy_order_id'] = res.get('id')
+            pos['base_amount'] = res.get('filled_amount') or 0.0
+        else:
+            res = place_market_buy(symbol, settings.QUOTE_AMOUNT_PER_TRADE)
+            pos['buy_order_id'] = res.get('id')
+            if res.get('status') == 'closed' and res.get('filled_amount'):
+                apply_fill(pos, res['filled_amount'], res['avg_price'])
+                protect_position(pos, symbol)      # protected immediately, no 60s gap
+            # otherwise stays pending_fill and Step 1 handles it
         return pos
     except Exception as e:
-        pos['status'] = 'open'
-        pos['virtual'] = True
-        pos['error'] = str(e)
-        notify_error(f"⚠️ [{symbol}] {label} order failed on this account ({e}) — tracking signal anyway for subscribers")
-        print(f"[{symbol}] Order placement failed, tracking as virtual: {e}")
+        pos.update(status='open', virtual=True, error=str(e))
+        notify_error(f"⚠️ [{symbol}] {label} order failed ({e}) — tracking signal anyway")
         return pos
 
 
@@ -337,11 +372,8 @@ def run_coin_trader(symbol: Optional[str] = None):
                 elif outcome == 'filled':
                     print(f"[{symbol}] ✅ Limit buy filled @ {pos['entry']} — placing OCO")
                     state_changed = True
-                    try:
-                        oco_result = place_oco_sell(symbol, pos['base_amount'], pos['take_profit'], pos['stop_loss'])
-                        pos['oco_order_id'] = oco_result.get('id') or oco_result.get('orderListId')
-                    except Exception as e:
-                        notify_error(f"🚨 [{symbol}] UNPROTECTED POSITION — buy filled but OCO failed: {e}")
+                    if not pos.get('oco_order_id'):
+                        protect_position(pos, symbol)
                     still_pending.append(pos)
 
             open_positions = still_pending
@@ -349,7 +381,30 @@ def run_coin_trader(symbol: Optional[str] = None):
             # Step 2: Candle-based TP / SL check
             closed_positions = []
             for pos in open_positions:
-                if pos.get('status') == 'pending_fill' or pos['action'] != 'BUY':
+                if pos.get('status') != 'open' or pos['action'] != 'BUY':
+                    continue
+
+                oco_id = pos.get('oco_order_id')
+
+                # Real OCO: Binance is the source of truth
+                if oco_id is not None and not pos.get('virtual'):
+                    r = check_oco(symbol, oco_id, pos['take_profit'], pos['stop_loss'])
+                    state = r['state']
+
+                    if state == 'tp':
+                        daily_pnl = close_position(pos, r['exit_price'] or pos['take_profit'],
+                                                "TP Hit (OCO filled)", daily_pnl, symbol)
+                        closed_positions.append(pos); last_tp_time = now
+                    elif state == 'sl':
+                        daily_pnl = close_position(pos, r['exit_price'] or pos['stop_loss'],
+                                                "SL Hit (OCO filled)", daily_pnl, symbol)
+                        closed_positions.append(pos); last_sl_time = now
+                    elif state in ('canceled', 'rejected'):
+                        # Coins are still held but unprotected: re-arm
+                        notify_error(f"⚠️ [{symbol}] OCO {oco_id} ended without fill ({state}) — re-placing")
+                        pos['oco_order_id'] = None
+                        protect_position(pos, symbol)
+                    # 'open' / 'unknown' -> do nothing this loop
                     continue
 
                 if candle_high >= pos['take_profit']:
@@ -396,18 +451,16 @@ def run_coin_trader(symbol: Optional[str] = None):
                     if still_bullish:
                         new_entry = round(current_price * (1 - settings.ENTRY_OFFSET_PCT), decimals)
                         rung_tp_pct = pyr_barrier_probs.get('recommended_tp', TP_PCT)
-                        new_tp = round(new_entry * (1 + rung_tp_pct), decimals)
-                        new_sl = round(new_entry * (1 - SL_PCT), decimals)
-
-                        new_pos = open_position_with_limit_buy(new_entry, new_tp, new_sl, now, 'pyramid entry', symbol)
+                        new_pos = open_position(new_entry, rung_tp_pct, SL_PCT, now, 'pyramid entry', symbol, is_pyramid=True)
                         open_positions.append(new_pos)
+
                         daily_trades += 1
                         virtual_tag = " 🔸(signal only)" if new_pos.get('virtual') else " (pending fill)"
                         send_message(
                             f"🔼 <b>[{symbol}] Pyramid entry #{len(open_positions)}{virtual_tag}</b>\n\n"
                             f"💰 Entry: <b>{new_entry}</b>\n"
-                            f"🎯 TP:    <b>{new_tp} (+{rung_tp_pct*100:.0f}% Fib)</b>\n"
-                            f"🛑 SL:    <b>{new_sl}</b>\n"
+                            f"🎯 TP:    <b>{new_pos['take_profit']} (+{rung_tp_pct*100:.1f}% Fib)</b>\n"
+                            f"🛑 SL:    <b>{new_pos['stop_loss']}</b>\n"
                             f"📊 {reason}"
                         )
                     save_bot_state(symbol, open_positions, daily_trades, daily_pnl, last_day)
@@ -522,11 +575,9 @@ def run_coin_trader(symbol: Optional[str] = None):
                 barrier_tp = barrier_probs.get('recommended_tp', 0.03) if barrier_model is not None else model_tp
                 effective_tp = max(model_tp, barrier_tp)
 
-                adjusted_entry = round(current_price * (1 - settings.ENTRY_OFFSET_PCT), decimals)
-                signal['fib_target_pct'] = effective_tp
-                signal['entry'] = adjusted_entry
-                signal['take_profit'] = round(adjusted_entry * (1 + effective_tp), decimals)
-                signal['stop_loss'] = round(adjusted_entry * (1 - SL_PCT), decimals)
+                signal['entry'] = current_price
+                signal['take_profit'] = round(current_price * (1 + effective_tp), decimals)
+                signal['stop_loss'] = round(current_price * (1 - SL_PCT), decimals)
 
             liq_info = f"Liq: {liq['bias']} ({liq['liq_ratio']:.0%})" if liq else "Liq: N/A"
             btc_info = f"BTC: {btc_bias}"
@@ -549,9 +600,8 @@ def run_coin_trader(symbol: Optional[str] = None):
 
                 notify_signal_with_liq(signal, daily_trades + 1, liq, level_text, symbol=symbol)
 
-                new_pos = open_position_with_limit_buy(
-                    signal['entry'], signal['take_profit'], signal['stop_loss'], now, 'fresh entry', symbol
-                )
+                new_pos = open_position(current_price, effective_tp, SL_PCT, now, 'fresh entry', symbol)
+
                 open_positions.append(new_pos)
                 daily_trades += 1
                 save_bot_state(symbol, open_positions, daily_trades, daily_pnl, last_day)

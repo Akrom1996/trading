@@ -263,6 +263,76 @@ class BinanceClient:
         print(f"[BinanceClient] 🎯 LIVE OCO Sell set for {symbol}: TP @ {tp} | SL @ {sl_tr} (orderListId: {order.get('orderListId')})")
         return order
 
+    def check_oco(self, symbol: str, oco_id, tp_price: Optional[float] = None,
+              sl_price: Optional[float] = None) -> Dict[str, Any]:
+        """
+        Asks Binance what happened to an OCO order list.
+        Returns {'state', 'exit_price', 'filled_amount'} where state is one of:
+        'open'      - both legs still live
+        'tp'        - take-profit leg filled
+        'sl'        - stop-loss leg filled
+        'canceled'  - list finished with no fill (canceled/expired); coins are still held
+        'rejected'  - Binance rejected the list
+        'dry_run'   - no real OCO exists; caller should use candle logic
+        'unknown'   - API error; caller should do nothing and retry next loop
+        """
+        result = {'state': 'unknown', 'exit_price': None, 'filled_amount': None}
+
+        if self.dry_run or str(oco_id).startswith('dry-run-'):
+            result['state'] = 'dry_run'
+            return result
+
+        try:
+            exchange = self.get_exchange()
+            get_list = (getattr(exchange, 'private_get_orderlist', None)
+                        or getattr(exchange, 'privateGetOrderList'))
+            lst = get_list({'orderListId': oco_id})
+
+            list_status = lst.get('listOrderStatus')
+            if list_status == 'EXECUTING':
+                result['state'] = 'open'
+                return result
+            if list_status == 'REJECT':
+                result['state'] = 'rejected'
+                return result
+
+            # ALL_DONE: find which leg filled
+            best = None
+            for leg in lst.get('orders', []):
+                o = exchange.fetch_order(str(leg['orderId']), symbol=symbol)
+                filled = float(o.get('filled', 0) or 0)
+                if filled <= 0:
+                    continue
+
+                avg = o.get('average')
+                if avg is None:
+                    cost = float(o.get('cost', 0) or 0)
+                    avg = cost / filled if cost else None
+                avg = float(avg) if avg is not None else None
+
+                raw_type = str((o.get('info') or {}).get('type', '')).upper()
+                if raw_type in ('LIMIT_MAKER', 'LIMIT'):
+                    kind = 'tp'
+                elif raw_type.startswith('STOP_LOSS'):
+                    kind = 'sl'
+                elif avg is not None and tp_price and sl_price:   # fallback: nearest level
+                    kind = 'tp' if abs(avg - tp_price) < abs(avg - sl_price) else 'sl'
+                else:
+                    kind = None
+
+                if kind and (best is None or filled > best['filled_amount']):
+                    best = {'state': kind, 'exit_price': avg, 'filled_amount': filled}
+
+            if best:
+                return best
+
+            result['state'] = 'canceled'
+            return result
+
+        except Exception as e:
+            print(f"[BinanceClient] check_oco error for {oco_id}: {e}")
+            return result
+    
     def place_market_buy(self, symbol: str, quote_amount: float, tp_price: Optional[float] = None, sl_price: Optional[float] = None) -> Dict[str, Any]:
         """Direct market buy for instant execution."""
         exchange = self.get_exchange()
@@ -359,6 +429,9 @@ def cancel_order(symbol: str, order_id: str) -> bool:
 
 def place_oco_sell(symbol: str, base_amount: float, tp_price: float, sl_price: float) -> Dict[str, Any]:
     return get_binance_client().place_oco_sell(symbol, base_amount, tp_price, sl_price)
+
+def check_oco(symbol: str, oco_id, tp_price=None, sl_price=None) -> Dict[str, Any]:
+    return get_binance_client().check_oco(symbol, oco_id, tp_price, sl_price)
 
 def place_market_buy(symbol: str, quote_amount: float, tp_price: Optional[float] = None, sl_price: Optional[float] = None) -> Dict[str, Any]:
     return get_binance_client().place_market_buy(symbol, quote_amount, tp_price, sl_price)
