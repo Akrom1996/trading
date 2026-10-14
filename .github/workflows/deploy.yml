@@ -27,10 +27,7 @@ jobs:
             set -euxo pipefail
 
             echo "=== SERVER ==="
-            hostname
-            whoami
-            pwd
-
+          
             echo "=== DOCKER ==="
             command -v docker
             docker --version
@@ -40,6 +37,7 @@ jobs:
             echo "=== PROJECT ==="
             cd /root/trading
             pwd
+            git stash
             git status
             git fetch origin main
             git reset --hard origin/main
