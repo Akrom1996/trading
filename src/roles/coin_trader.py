@@ -73,7 +73,7 @@ def normalize_position(pos: dict, decimals: int, symbol: str) -> dict:
     if 'take_profit' not in pos:
         pos['take_profit'] = round(pos['entry'] * (1 + TP_PCT), decimals)
     if 'stop_loss' not in pos:
-        pos['stop_loss'] = round(pos['entry'] * (1 - SL_PCT), decimals)
+        pos['stop_loss'] = round(pos['entry'] * (1 - settings.MAX_RISK_PER_TRADE), decimals)
     if 'pyramided' not in pos:
         pos['pyramided'] = True
     if 'status' not in pos:
@@ -454,7 +454,7 @@ def run_coin_trader(symbol: Optional[str] = None):
                     if still_bullish:
                         new_entry = round(current_price * (1 - settings.ENTRY_OFFSET_PCT), decimals)
                         rung_tp_pct = pyr_barrier_probs.get('recommended_tp', TP_PCT)
-                        new_pos = open_position(new_entry, rung_tp_pct, SL_PCT, now, 'pyramid entry', symbol, is_pyramid=True)
+                        new_pos = open_position(new_entry, rung_tp_pct, settings.MAX_RISK_PER_TRADE, now, 'pyramid entry', symbol, is_pyramid=True)
                         open_positions.append(new_pos)
 
                         daily_trades += 1
@@ -587,7 +587,7 @@ def run_coin_trader(symbol: Optional[str] = None):
 
                 signal['entry'] = entry_price
                 signal['take_profit'] = round(entry_price * (1 + effective_tp), decimals)
-                signal['stop_loss'] = round(entry_price * (1 - SL_PCT), decimals)
+                signal['stop_loss'] = round(entry_price * (1 - settings.MAX_RISK_PER_TRADE), decimals)
                 signal['order_type'] = order_type
 
             liq_info = f"Liq: {liq['bias']} ({liq['liq_ratio']:.0%})" if liq else "Liq: N/A"
@@ -613,7 +613,7 @@ def run_coin_trader(symbol: Optional[str] = None):
 
                 order_label = f"fresh {order_type} entry"
                 new_pos = open_position(
-                    entry_price, effective_tp, SL_PCT, now,
+                    entry_price, effective_tp, settings.MAX_RISK_PER_TRADE, now,
                     order_label, symbol, order_type=order_type
                 )
 

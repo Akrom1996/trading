@@ -47,7 +47,7 @@ TIER_TO_PCT = {
 }
 
 LABEL_HORIZON_CANDLES = 144
-DEFAULT_SL_PCT = 0.02
+DEFAULT_SL_PCT = getattr(settings, 'MAX_RISK_PER_TRADE', 0.02)
 DEFAULT_TP_PCT = 0.03
 TP_PCT = DEFAULT_TP_PCT
 SL_PCT = DEFAULT_SL_PCT
@@ -172,8 +172,10 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
     return df.dropna(subset=feature_cols).reset_index(drop=True)
 
 
-def add_labels(df: pd.DataFrame, horizon: int = LABEL_HORIZON_CANDLES, sl_pct: float = DEFAULT_SL_PCT) -> pd.DataFrame:
+def add_labels(df: pd.DataFrame, horizon: int = LABEL_HORIZON_CANDLES, sl_pct: Optional[float] = None) -> pd.DataFrame:
     """Labels forward Fibonacci expansion tiers reached before SL."""
+    if sl_pct is None:
+        sl_pct = getattr(settings, 'MAX_RISK_PER_TRADE', DEFAULT_SL_PCT)
     closes = df['close'].values
     highs = df['high'].values
     lows = df['low'].values
@@ -216,8 +218,10 @@ def add_labels(df: pd.DataFrame, horizon: int = LABEL_HORIZON_CANDLES, sl_pct: f
     return out.reset_index(drop=True)
 
 
-def label_triple_barrier(df: pd.DataFrame, horizon: int = LABEL_HORIZON_CANDLES, sl_pct: float = SL_PCT, tp_pct: float = DEFAULT_TP_PCT) -> pd.DataFrame:
+def label_triple_barrier(df: pd.DataFrame, horizon: int = LABEL_HORIZON_CANDLES, sl_pct: Optional[float] = None, tp_pct: float = DEFAULT_TP_PCT) -> pd.DataFrame:
     """Triple-barrier labeling for spot trades."""
+    if sl_pct is None:
+        sl_pct = getattr(settings, 'MAX_RISK_PER_TRADE', SL_PCT)
     closes = df['close'].values
     highs = df['high'].values
     lows = df['low'].values
@@ -513,9 +517,10 @@ def predict_barrier_probabilities(model: Any, scaler: Any, encoder: Any, df_late
 def should_enter(barrier_probs: Dict[str, Any], min_profit_prob: float = 0.35) -> Tuple[bool, str]:
     p = barrier_probs['p_tp_first']
     rec_tp = barrier_probs.get('recommended_tp', DEFAULT_TP_PCT)
+    sl = getattr(settings, 'MAX_RISK_PER_TRADE', SL_PCT)
     if p >= min_profit_prob:
-        return True, f"P(Fib profit before -{SL_PCT*100:.1f}%)={p:.0%} (Target: +{rec_tp*100:.0f}%) — entering"
-    return False, f"P(Fib profit before -{SL_PCT*100:.1f}%)={p:.0%} below {min_profit_prob:.0%} threshold — skipping"
+        return True, f"P(Fib profit before -{sl*100:.1f}%)={p:.0%} (Target: +{rec_tp*100:.0f}%) — entering"
+    return False, f"P(Fib profit before -{sl*100:.1f}%)={p:.0%} below {min_profit_prob:.0%} threshold — skipping"
 
 
 # ── Signal Generation ───────────────────────────────────────────
@@ -548,13 +553,14 @@ def generate_signal(model: Any, scaler: Any, encoder: Any, df: pd.DataFrame, min
 
     if pred >= 1 and (confidence >= min_confidence or p_bullish >= 0.45):
         target_pct = TIER_TO_PCT.get(int(pred), 0.03)
-        sl_pct = 0.02
+        sl_pct = getattr(settings, 'MAX_RISK_PER_TRADE', SL_PCT)
         signal['action'] = 'BUY'
         signal['take_profit'] = round(current_price * (1.0 + target_pct), 4)
         signal['stop_loss'] = round(current_price * (1.0 - sl_pct), 4)
     elif pred == -1 and confidence >= min_confidence:
+        sl_pct = getattr(settings, 'MAX_RISK_PER_TRADE', SL_PCT)
         signal['action'] = 'SELL'
-        signal['take_profit'] = round(current_price * 0.98, 4)
-        signal['stop_loss'] = round(current_price * 1.02, 4)
+        signal['take_profit'] = round(current_price * (1.0 - target_pct), 4)
+        signal['stop_loss'] = round(current_price * (1.0 + sl_pct), 4)
 
     return signal

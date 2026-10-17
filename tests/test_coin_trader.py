@@ -95,7 +95,7 @@ class TestCoinTrader(unittest.TestCase):
         current_price = 150.0
         decimals = get_decimal_places(current_price)
         effective_tp = 0.04
-        sl_pct = 0.02
+        sl_pct = settings.MAX_RISK_PER_TRADE
 
         # 1. Bullish regime -> market buy at current_price
         btc_bias = "BULLISH"
@@ -110,8 +110,8 @@ class TestCoinTrader(unittest.TestCase):
         self.assertEqual(entry_price, 150.0)
         tp = round(entry_price * (1 + effective_tp), decimals)
         sl = round(entry_price * (1 - sl_pct), decimals)
-        self.assertEqual(tp, 156.0)
-        self.assertEqual(sl, 147.0)
+        self.assertEqual(tp, round(150.0 * (1 + effective_tp), decimals))
+        self.assertEqual(sl, round(150.0 * (1 - sl_pct), decimals))
 
         # 2. Neutral regime -> limit buy using ENTRY_OFFSET_PCT
         btc_bias = "NEUTRAL"
@@ -128,8 +128,8 @@ class TestCoinTrader(unittest.TestCase):
         self.assertLess(entry_price, current_price)
         tp = round(entry_price * (1 + effective_tp), decimals)
         sl = round(entry_price * (1 - sl_pct), decimals)
-        self.assertEqual(tp, round(expected_limit_price * 1.04, decimals))
-        self.assertEqual(sl, round(expected_limit_price * 0.98, decimals))
+        self.assertEqual(tp, round(expected_limit_price * (1 + effective_tp), decimals))
+        self.assertEqual(sl, round(expected_limit_price * (1 - sl_pct), decimals))
 
     def test_telegram_signal_order_type_display(self):
         notifier = TelegramNotifier()
@@ -157,6 +157,20 @@ class TestCoinTrader(unittest.TestCase):
         }
         notifier.notify_signal_with_liq(signal_lmt, daily_trades=2, symbol=self.symbol)
         self.assertTrue(any("BUY Signal (LIMIT)" in m for m in sent_messages))
+
+    def test_max_risk_per_trade_applied_to_stop_loss(self):
+        from src.roles.coin_trader import normalize_position
+        orig_risk = settings.MAX_RISK_PER_TRADE
+        try:
+            settings.MAX_RISK_PER_TRADE = 0.03
+            pos = normalize_position({"action": "BUY", "entry": 100.0}, decimals=2, symbol=self.symbol)
+            self.assertEqual(pos["stop_loss"], 97.0)
+
+            settings.MAX_RISK_PER_TRADE = 0.05
+            pos2 = normalize_position({"action": "BUY", "entry": 100.0}, decimals=2, symbol=self.symbol)
+            self.assertEqual(pos2["stop_loss"], 95.0)
+        finally:
+            settings.MAX_RISK_PER_TRADE = orig_risk
 
 
 if __name__ == "__main__":
