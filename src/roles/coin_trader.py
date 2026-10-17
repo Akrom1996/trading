@@ -175,7 +175,10 @@ def protect_position(pos: dict, symbol: str):
 
 
 def open_position(price: float, tp_pct: float, sl_pct: float, now: datetime,
-                  label: str, symbol: str, is_pyramid: bool = False) -> dict:
+                  label: str, symbol: str, is_pyramid: bool = False,
+                  order_type: Optional[str] = None) -> dict:
+    if order_type is None:
+        order_type = 'limit' if is_pyramid else 'market'
     d = get_decimal_places(price)
     pos = {
         'action': 'BUY',
@@ -184,7 +187,7 @@ def open_position(price: float, tp_pct: float, sl_pct: float, now: datetime,
         'stop_loss': round(price * (1 - sl_pct), d),
         'tp_pct': tp_pct,
         'sl_pct': sl_pct,
-        'order_type': 'limit' if is_pyramid else 'market',
+        'order_type': order_type,
         'pyramided': False,                 # parent gets set to True in Step 3
         'status': 'pending_fill',
         'buy_order_id': None,
@@ -195,7 +198,7 @@ def open_position(price: float, tp_pct: float, sl_pct: float, now: datetime,
         'opened_at': now.strftime('%H:%M'),
     }
     try:
-        if is_pyramid:
+        if order_type == 'limit':
             res = place_limit_buy(symbol, price, settings.QUOTE_AMOUNT_PER_TRADE)
             pos['buy_order_id'] = res.get('id')
             pos['base_amount'] = res.get('filled_amount') or 0.0
@@ -526,7 +529,7 @@ def run_coin_trader(symbol: Optional[str] = None):
             # STEP 1: CHECK BTC MACRO REGIME FIRST (Circuit Breaker)
             # -------------------------------------------------------------
             btc_macro = get_shared_value("btc:macro_regime")
-            btc_bias = btc_macro.get('bias', 'NEUTRAL') if btc_macro else 'NEUTRAL'
+            btc_bias = (btc_macro.get('bias', 'NEUTRAL') if btc_macro else 'NEUTRAL').strip().upper()
 
             # If BTC is BEARISH and signal is BUY, demote immediately and skip!
             if btc_bias == 'BEARISH' and signal.get('action') == 'BUY':
@@ -575,9 +578,17 @@ def run_coin_trader(symbol: Optional[str] = None):
                 barrier_tp = barrier_probs.get('recommended_tp', 0.03) if barrier_model is not None else model_tp
                 effective_tp = max(model_tp, barrier_tp)
 
-                signal['entry'] = current_price
-                signal['take_profit'] = round(current_price * (1 + effective_tp), decimals)
-                signal['stop_loss'] = round(current_price * (1 - SL_PCT), decimals)
+                if btc_bias == 'BULLISH':
+                    entry_price = current_price
+                    order_type = 'market'
+                else:
+                    entry_price = round(current_price * (1 - settings.ENTRY_OFFSET_PCT), decimals)
+                    order_type = 'limit'
+
+                signal['entry'] = entry_price
+                signal['take_profit'] = round(entry_price * (1 + effective_tp), decimals)
+                signal['stop_loss'] = round(entry_price * (1 - SL_PCT), decimals)
+                signal['order_type'] = order_type
 
             liq_info = f"Liq: {liq['bias']} ({liq['liq_ratio']:.0%})" if liq else "Liq: N/A"
             btc_info = f"BTC: {btc_bias}"
@@ -600,7 +611,11 @@ def run_coin_trader(symbol: Optional[str] = None):
 
                 notify_signal_with_liq(signal, daily_trades + 1, liq, level_text, symbol=symbol)
 
-                new_pos = open_position(current_price, effective_tp, SL_PCT, now, 'fresh entry', symbol)
+                order_label = f"fresh {order_type} entry"
+                new_pos = open_position(
+                    entry_price, effective_tp, SL_PCT, now,
+                    order_label, symbol, order_type=order_type
+                )
 
                 open_positions.append(new_pos)
                 daily_trades += 1

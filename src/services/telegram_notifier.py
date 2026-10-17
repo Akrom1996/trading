@@ -71,9 +71,10 @@ class TelegramNotifier:
         fib_str = f" (+{fib_target*100:.0f}% Fib)" if fib_target else ""
         p_bull = signal.get('p_bullish')
         conf_str = f"{signal.get('confidence', 0):.0%}" + (f" (Bullish: {p_bull:.0%})" if p_bull else "")
+        order_type_str = f" ({signal.get('order_type').upper()})" if signal.get('order_type') else ""
 
         msg = (
-            f"{emoji} <b>{signal.get('action')} Signal — {symbol}</b>\n\n"
+            f"{emoji} <b>{signal.get('action')} Signal{order_type_str} — {symbol}</b>\n\n"
             f"💰 Entry:       <b>{signal.get('entry')}</b>\n"
             f"🎯 Take Profit: <b>{signal.get('take_profit')}</b>{fib_str}\n"
             f"🛑 Stop Loss:   <b>{signal.get('stop_loss')}</b>\n"
@@ -86,8 +87,9 @@ class TelegramNotifier:
 
     def notify_signal(self, signal: Dict[str, Any], daily_trades: int, symbol: str = 'SOL/USDT'):
         emoji = '🟢' if signal.get('action') == 'BUY' else '🔴'
+        order_type_str = f" ({signal.get('order_type').upper()})" if signal.get('order_type') else ""
         msg = (
-            f"{emoji} <b>{signal.get('action')} Signal — {symbol}</b>\n\n"
+            f"{emoji} <b>{signal.get('action')} Signal{order_type_str} — {symbol}</b>\n\n"
             f"💰 Entry:       <b>{signal.get('entry')}</b>\n"
             f"🎯 Take Profit: <b>{signal.get('take_profit')}</b>\n"
             f"🛑 Stop Loss:   <b>{signal.get('stop_loss')}</b>\n"

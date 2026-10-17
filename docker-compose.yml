@@ -83,6 +83,24 @@ services:
     mem_limit: 600m
     memswap_limit: 1200m
 
+  bot-tia:
+    build: .
+    container_name: bot-tia
+    environment:
+      - SYMBOL=TIA/USDT
+      - ROLE=coin_trader
+      - REDIS_URL=redis://redis:6379/0
+      - DB_PATH=/app/data/bot_data.db
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+    depends_on:
+      - redis
+    restart: unless-stopped
+    mem_limit: 600m
+    memswap_limit: 1200m
+
   bot-qnt:
     build: .
     container_name: bot-qnt
@@ -101,11 +119,30 @@ services:
     mem_limit: 600m
     memswap_limit: 1200m
 
+
   bot-bnb:
     build: .
     container_name: bot-bnb
     environment:
       - SYMBOL=BNB/USDT
+      - ROLE=coin_trader
+      - REDIS_URL=redis://redis:6379/0
+      - DB_PATH=/app/data/bot_data.db
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+    depends_on:
+      - redis
+    restart: unless-stopped
+    mem_limit: 600m
+    memswap_limit: 1200m
+
+  bot-dash:
+    build: .
+    container_name: bot-dash
+    environment:
+      - SYMBOL=DASH/USDT
       - ROLE=coin_trader
       - REDIS_URL=redis://redis:6379/0
       - DB_PATH=/app/data/bot_data.db
