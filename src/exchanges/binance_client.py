@@ -210,6 +210,52 @@ class BinanceClient:
             print(f"[BinanceClient] cancel_order failed for {order_id}: {e}")
             return False
 
+    def cancel_oco(self, symbol: str, oco_id: Any) -> bool:
+        """Cancels an active OCO order list on Binance."""
+        if oco_id is None:
+            return True
+
+        if self.dry_run or str(oco_id).startswith('dry-run-'):
+            print(f"[BinanceClient] 🧪 DRY_RUN cancel OCO {oco_id} for {symbol}")
+            return True
+
+        exchange = self.get_exchange()
+        market = exchange.market(symbol)
+
+        # 1. Try native delete_orderlist endpoint
+        try:
+            delete_fn = getattr(exchange, 'private_delete_orderlist', None) or getattr(exchange, 'privateDeleteOrderList', None)
+            if delete_fn is not None:
+                params = {'symbol': market['id']}
+                try:
+                    params['orderListId'] = int(oco_id)
+                except (ValueError, TypeError):
+                    params['listClientOrderId'] = str(oco_id)
+                delete_fn(params)
+                print(f"[BinanceClient] 🚫 Canceled OCO orderList {oco_id} for {symbol}")
+                return True
+        except Exception as e:
+            print(f"[BinanceClient] private_delete_orderlist failed for {oco_id}: {e}")
+
+        # 2. Try cancel_order_list if ccxt supports it
+        try:
+            cancel_list_fn = getattr(exchange, 'cancel_order_list', None)
+            if cancel_list_fn is not None:
+                cancel_list_fn(str(oco_id), symbol=symbol)
+                print(f"[BinanceClient] 🚫 cancel_order_list succeeded for {oco_id}")
+                return True
+        except Exception as e:
+            print(f"[BinanceClient] cancel_order_list failed for {oco_id}: {e}")
+
+        # 3. Fallback: try cancel_order (cancelling either leg cancels the OCO on Binance)
+        try:
+            exchange.cancel_order(str(oco_id), symbol=symbol)
+            print(f"[BinanceClient] 🚫 cancel_order succeeded as fallback for {oco_id}")
+            return True
+        except Exception as e:
+            print(f"[BinanceClient] cancel_order fallback failed for {oco_id}: {e}")
+            return False
+
     def place_oco_sell(self, symbol: str, base_amount: float, tp_price: float, sl_price: float) -> Dict[str, Any]:
         """
         Places a native OCO (One-Cancels-the-Other) sell order on Binance.
@@ -438,4 +484,8 @@ def place_market_buy(symbol: str, quote_amount: float, tp_price: Optional[float]
 
 def place_market_sell(symbol: str, base_amount: float) -> Dict[str, Any]:
     return get_binance_client().place_market_sell(symbol, base_amount)
+
+def cancel_oco(symbol: str, oco_id: Any) -> bool:
+    return get_binance_client().cancel_oco(symbol, oco_id)
+
 

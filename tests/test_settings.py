@@ -14,6 +14,10 @@ class TestSettings(unittest.TestCase):
         self.assertIsInstance(settings.ENTRY_OFFSET_PCT, float)
         self.assertIsInstance(settings.SL_COOLDOWN_MINUTES, float)
         self.assertIsInstance(settings.TP_COOLDOWN_MINUTES, float)
+        self.assertIsInstance(settings.PROFIT_LOCK_TRIGGER_PCT, float)
+        self.assertIsInstance(settings.PROFIT_LOCK_SL_PCT, float)
+        self.assertEqual(settings.PROFIT_LOCK_TRIGGER_PCT, 0.01)
+        self.assertEqual(settings.PROFIT_LOCK_SL_PCT, 0.01)
         self.assertIn(settings.ROLE, ["coin_trader", "btc_analyzer", "reporter"])
 
     def test_custom_settings(self):
