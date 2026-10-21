@@ -169,13 +169,14 @@ def apply_fill(pos: dict, filled, avg_price):
             pos['stop_loss'] = round(avg_price * (1 - pos['sl_pct']), d)
 
 
-def protect_position(pos: dict, symbol: str):
+def protect_position(pos: dict, symbol: str) -> bool:
     try:
         oco = place_oco_sell(symbol, pos['base_amount'], pos['take_profit'], pos['stop_loss'])
         pos['oco_order_id'] = oco.get('id') or oco.get('orderListId')
+        return True
     except Exception as e:
-        notify_error(f"🚨 [{symbol}] UNPROTECTED POSITION — buy filled but OCO failed: {e}")
-
+        notify_error(f"🚨 [{symbol}] UNPROTECTED POSITION — OCO failed: {e}")
+        return False
 
 def open_position(price: float, tp_pct: float, sl_pct: float, now: datetime,
                   label: str, symbol: str, is_pyramid: bool = False,
@@ -443,55 +444,50 @@ def run_coin_trader(symbol: Optional[str] = None):
 
             # ── Step 2.5: Profit Lock / Breakeven check (+1% gain protection) ──
             for pos in open_positions:
-                if pos.get('status') != 'open' or pos.get('action') != 'BUY':
-                    continue
-                if pos.get('profit_locked'):
+                if pos.get('status') != 'open' or pos.get('action') != 'BUY' or pos.get('profit_locked'):
                     continue
 
                 entry_price = float(pos['entry'])
                 gain_pct = (current_price - entry_price) / entry_price
+                if gain_pct < settings.PROFIT_LOCK_TRIGGER_PCT:
+                    continue
 
-                if gain_pct >= settings.PROFIT_LOCK_TRIGGER_PCT:
-                    target_sl = round(entry_price * (1 + settings.PROFIT_LOCK_SL_PCT), decimals)
-                    # Stop price must be strictly lower than current price for sell stop loss
-                    safe_sl = min(target_sl, round(current_price * 0.998, decimals))
+                target_sl = round(entry_price * (1 + settings.PROFIT_LOCK_SL_PCT), decimals)
+                safe_sl = min(target_sl, round(current_price * 0.998, decimals))
+                if safe_sl <= float(pos['stop_loss']):
+                    continue
 
-                    if safe_sl > float(pos['stop_loss']):
-                        print(
-                            f"[{symbol}] 🛡️ Profit Lock Triggered: current price {current_price} is "
-                            f"+{gain_pct*100:.2f}% above entry {entry_price}. Moving SL {pos['stop_loss']} -> "
-                            f"{safe_sl} (+{((safe_sl - entry_price)/entry_price)*100:.2f}%)"
-                        )
+                real = not pos.get('virtual')
 
-                        # Cancel active exchange OCO before placing new one
-                        if pos.get('oco_order_id') and not pos.get('virtual'):
-                            old_oco_id = pos['oco_order_id']
-                            try:
-                                cancel_oco(symbol, old_oco_id)
-                                pos['oco_order_id'] = None
-                                time.sleep(0.3)
-                            except Exception as e:
-                                notify_error(f"[{symbol}] Error cancelling old OCO {old_oco_id} for profit lock: {e}")
+                # Cancel first. If it fails, change NOTHING and retry next loop;
+                # Step 2 will reconcile it if the OCO actually filled.
+                if real and pos.get('oco_order_id'):
+                    try:
+                        cancel_oco(symbol, pos['oco_order_id'])
+                    except Exception as e:
+                        notify_error(f"[{symbol}] Profit lock skipped, cancel_oco failed: {e}")
+                        continue
+                    pos['oco_order_id'] = None
+                    time.sleep(0.3)
 
-                        pos['stop_loss'] = safe_sl
-                        pos['profit_locked'] = True
-                        pos['sl_pct'] = -round((safe_sl - entry_price) / entry_price, 4)
+                pos['stop_loss'] = safe_sl
+                pos['profit_locked'] = True
+                pos['sl_pct'] = -round((safe_sl - entry_price) / entry_price, 4)
 
-                        # Re-arm OCO with new SL and untouched TP
-                        if not pos.get('virtual'):
-                            protect_position(pos, symbol)
+                protected = protect_position(pos, symbol) if real else True
+                pnl_locked = ((safe_sl - entry_price) / entry_price) * 100
 
-                        pnl_locked = ((safe_sl - entry_price) / entry_price) * 100
-                        send_message(
-                            f"🛡️ <b>[{symbol}] Profit Locked at +{pnl_locked:.1f}%!</b>\n\n"
-                            f"💰 Entry: <b>{entry_price}</b>\n"
-                            f"💵 Current Price: <b>{current_price} (+{gain_pct*100:.2f}%)</b>\n"
-                            f"🛑 Stop Loss Moved: <b>{safe_sl} (+{pnl_locked:.1f}%)</b>\n"
-                            f"🎯 Take Profit: <b>{pos['take_profit']}</b> (unchanged)\n\n"
-                            f"<i>Trade is now risk-free — SL raised above entry!</i>"
-                        )
-                        save_bot_state(symbol, open_positions, daily_trades, daily_pnl, last_day)
-
+                footer = ("<i>Trade is now risk-free — SL raised above entry!</i>" if protected
+                        else "<i>⚠️ Exchange re-arm failed — bot is watching this stop manually.</i>")
+                send_message(
+                    f"🛡️ <b>[{symbol}] Profit Locked at +{pnl_locked:.1f}%!</b>\n\n"
+                    f"💰 Entry: <b>{entry_price}</b>\n"
+                    f"💵 Current Price: <b>{current_price} (+{gain_pct*100:.2f}%)</b>\n"
+                    f"🛑 Stop Loss Moved: <b>{safe_sl} (+{pnl_locked:.1f}%)</b>\n"
+                    f"🎯 Take Profit: <b>{pos['take_profit']}</b> (unchanged)\n\n{footer}"
+                )
+                save_bot_state(symbol, open_positions, daily_trades, daily_pnl, last_day)
+            
             # Step 3: Pyramiding
             is_sl_cooldown = last_sl_time is not None and (now - last_sl_time).total_seconds() < settings.SL_COOLDOWN_MINUTES * 60
             if (len(open_positions) < settings.MAX_PYRAMID_POSITIONS
@@ -517,7 +513,7 @@ def run_coin_trader(symbol: Optional[str] = None):
                     pos['pyramided'] = True
 
                     if still_bullish:
-                        new_entry = round(current_price * (1 - settings.ENTRY_OFFSET_PCT), decimals)
+                        new_entry = round(current_price * (1 - settings.ENTRY_OFFSET_PCT * 2), decimals)
                         rung_tp_pct = pyr_barrier_probs.get('recommended_tp', TP_PCT)
                         new_pos = open_position(new_entry, rung_tp_pct, settings.MAX_RISK_PER_TRADE, now, 'pyramid entry', symbol, is_pyramid=True)
                         open_positions.append(new_pos)
