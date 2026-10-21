@@ -8,6 +8,8 @@ from src.exchanges.binance_client import (
     place_market_buy,
     place_market_sell,
     place_oco_sell,
+    check_oco,
+    cancel_oco,
     check_order_status,
     cancel_order,
     get_available_balance,
@@ -22,8 +24,9 @@ __all__ = [
     "place_market_buy",
     "place_market_sell",
     "place_oco_sell",
+    "check_oco",
+    "cancel_oco",
     "check_order_status",
     "cancel_order",
     "get_available_balance",
 ]
-

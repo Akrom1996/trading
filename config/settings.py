@@ -41,6 +41,11 @@ try:
         MAX_RISK_PER_TRADE: float = Field(default=0.02, description="Maximum risk per trade (fraction)")
         MAX_DAILY_LOSS: float = Field(default=6.0, description="Maximum daily loss percentage before stopping")
 
+        # Profit Lock & Trailing Protection
+        PROFIT_LOCK_TRIGGER_PCT: float = Field(default=0.01, description="Price gain above entry to trigger profit lock (e.g. 0.01 for +1%)")
+        PROFIT_LOCK_SL_PCT: float = Field(default=0.01, description="New stop loss percentage above entry price when profit is locked (e.g. 0.01 for +1%)")
+        BTC_FILTER_ENABLED: bool = Field(default=False, description="Skip altcoin BUY entries if BTC macro regime is BEARISH")
+
         # Model & Market Dynamics
         TRAIN_CANDLES: int = Field(default=2880, description="Historical candles for training (10 days of 5m)")
         LIVE_CANDLES: int = Field(default=1000, description="Candles fetched for live inference")
@@ -95,6 +100,10 @@ except ImportError:
             self.MAX_TRADES_PER_DAY = int(os.getenv("MAX_TRADES_PER_DAY", "10"))
             self.MAX_RISK_PER_TRADE = float(os.getenv("MAX_RISK_PER_TRADE", "0.02"))
             self.MAX_DAILY_LOSS = float(os.getenv("MAX_DAILY_LOSS", "6.0"))
+
+            self.PROFIT_LOCK_TRIGGER_PCT = float(os.getenv("PROFIT_LOCK_TRIGGER_PCT", "0.01"))
+            self.PROFIT_LOCK_SL_PCT = float(os.getenv("PROFIT_LOCK_SL_PCT", "0.01"))
+            self.BTC_FILTER_ENABLED = _parse_bool(os.getenv("BTC_FILTER_ENABLED"), False)
 
             self.TRAIN_CANDLES = int(os.getenv("TRAIN_CANDLES", "2880"))
             self.LIVE_CANDLES = int(os.getenv("LIVE_CANDLES", "1000"))

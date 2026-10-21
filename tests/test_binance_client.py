@@ -49,6 +49,11 @@ class TestBinanceClient(unittest.TestCase):
         status = self.client.check_order_status('SOL/USDT', 'dry-run-limit-buy')
         self.assertEqual(status['status'], 'closed')
 
+    @unittest.skipUnless(HAS_CCXT, "ccxt not installed in local environment")
+    def test_dry_run_cancel_oco(self):
+        result = self.client.cancel_oco('SOL/USDT', 'dry-run-oco-sell')
+        self.assertTrue(result)
+
 
 if __name__ == "__main__":
     unittest.main()
