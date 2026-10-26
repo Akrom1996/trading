@@ -33,6 +33,11 @@ _STABLE_LIFETIME = 30   # seconds a connection must live to reset backoff
 _MAX_BACKOFF = 60
 _APP_PING_EVERY = 20    # seconds, for venues that want application-level pings
 
+# OKX geo-routes its REST API: www.okx.com returns 403 from some regions (e.g. EEA
+# servers such as Hetzner), which are served from my.okx.com instead. Try each in turn.
+_OKX_REST_HOSTS = ("www.okx.com", "my.okx.com", "app.okx.com")
+_HTTP_USER_AGENT = "Mozilla/5.0 (compatible; trading-bot/1.0)"
+
 
 def _normalize_symbol(symbol: str) -> str:
     """Accepts 'SOL', 'SOL/USDT', 'SOL-USDT' or 'SOLUSDT'; returns uppercase base ('SOL')."""
@@ -229,16 +234,24 @@ class MultiExchangeLiquidationTracker:
     def _fetch_okx_ct_val(self) -> bool:
         if self.okx_ct_val:
             return True
-        try:
-            url = f"https://www.okx.com/api/v5/public/instruments?instType=SWAP&instId={self.okx_inst}"
-            with urllib.request.urlopen(url, timeout=5) as r:
-                self.okx_ct_val = float(json.load(r)["data"][0]["ctVal"])
-            log.info("[liq:%s] OKX ctVal = %s", self.base_symbol, self.okx_ct_val)
-            return True
-        except Exception as e:
-            log.warning("[liq:%s] could not fetch OKX ctVal (%s); is %s listed?",
-                        self.base_symbol, e, self.okx_inst)
-            return False
+        errors = []
+        for host in _OKX_REST_HOSTS:
+            url = f"https://{host}/api/v5/public/instruments?instType=SWAP&instId={self.okx_inst}"
+            req = urllib.request.Request(url, headers={"User-Agent": _HTTP_USER_AGENT})
+            try:
+                with urllib.request.urlopen(req, timeout=5) as r:
+                    data = json.load(r).get("data") or []
+                if not data:
+                    log.warning("[liq:%s] %s is not listed on OKX", self.base_symbol, self.okx_inst)
+                    return False
+                self.okx_ct_val = float(data[0]["ctVal"])
+                log.info("[liq:%s] OKX ctVal = %s (via %s)", self.base_symbol, self.okx_ct_val, host)
+                return True
+            except Exception as e:
+                errors.append(f"{host}: {e}")
+        log.warning("[liq:%s] could not fetch OKX ctVal from any host (%s)",
+                    self.base_symbol, "; ".join(errors))
+        return False
 
     def _run_okx(self):
         sub = json.dumps({"op": "subscribe", "args": [{"channel": "liquidation-orders", "instType": "SWAP"}]})
