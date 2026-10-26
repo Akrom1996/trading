@@ -47,7 +47,7 @@ TIER_TO_PCT = {
 }
 
 LABEL_HORIZON_CANDLES = 144
-DEFAULT_SL_PCT = getattr(settings, 'MAX_RISK_PER_TRADE', 0.02)
+DEFAULT_SL_PCT = getattr(settings, 'MAX_RISK_PER_TRADE', 0.03)
 DEFAULT_TP_PCT = 0.03
 TP_PCT = DEFAULT_TP_PCT
 SL_PCT = DEFAULT_SL_PCT
@@ -83,6 +83,12 @@ FEATURE_COLUMNS = [
     'range_15m',
 ]
 FEATURES = FEATURE_COLUMNS
+
+FLOW_WINDOW = 288  # candles for rolling VWAP / OBV (1 day of 5m); must stay well below LIVE_CANDLES
+
+# Bump when a feature's definition changes without changing the column count,
+# so models saved with the old definition are retrained instead of reused.
+FEATURE_VERSION = 2  # v2: rolling VWAP / OBV instead of cumulative
 
 
 def _labels_are_valid(encoder: Any) -> bool:
@@ -145,8 +151,12 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
     df['atr_ratio'] = df['atr'] / df['close']
 
     # Volume & Flow
-    df['vwap'] = (df['close'] * df['volume']).cumsum() / (df['volume'].cumsum() + 1e-9)
-    df['obv'] = ta.volume.on_balance_volume(df['close'], df['volume'])
+    # Rolling (not cumulative) so values don't depend on how many candles were fetched:
+    # training uses TRAIN_CANDLES, live inference uses LIVE_CANDLES.
+    pv_sum = (df['close'] * df['volume']).rolling(FLOW_WINDOW).sum()
+    df['vwap'] = pv_sum / (df['volume'].rolling(FLOW_WINDOW).sum() + 1e-9)
+    signed_volume = np.sign(df['close'].diff()).fillna(0) * df['volume']
+    df['obv'] = signed_volume.rolling(FLOW_WINDOW).sum()
     df['vol_ma'] = df['volume'].rolling(20).mean()
     df['vol_ratio'] = df['volume'] / (df['vol_ma'] + 1e-9)
     df['vol_ratio_15m'] = df['volume'].rolling(3).mean() / (df['vol_ma'] + 1e-9)
@@ -172,49 +182,46 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
     return df.dropna(subset=feature_cols).reset_index(drop=True)
 
 
+def _forward_peak_gains(df: pd.DataFrame, horizon: int, sl_pct: float) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    For each candle i in [0, n - horizon), looks at candles i+1..i+horizon and returns
+    (peak gain of the highs before the first candle whose low hits SL, whether SL was hit).
+    Vectorized equivalent of the per-candle forward scan.
+    """
+    closes = df['close'].to_numpy(dtype=float)
+    highs = df['high'].to_numpy(dtype=float)
+    lows = df['low'].to_numpy(dtype=float)
+    m = len(df) - horizon
+    if m <= 0:
+        return np.zeros(0, dtype=float), np.zeros(0, dtype=bool)
+
+    windows = np.lib.stride_tricks.sliding_window_view
+    fwd_highs = windows(highs[1:], horizon)[:m]
+    fwd_lows = windows(lows[1:], horizon)[:m]
+    entry = closes[:m]
+
+    hit = fwd_lows <= (entry * (1.0 - sl_pct))[:, None]
+    stopped_out = hit.any(axis=1)
+    first_hit = np.where(stopped_out, hit.argmax(axis=1), horizon)
+    before_sl = np.arange(horizon)[None, :] < first_hit[:, None]
+
+    peak_high = np.where(before_sl, fwd_highs, -np.inf).max(axis=1)
+    peak_gain = np.maximum((peak_high - entry) / entry, 0.0)
+    return peak_gain, stopped_out
+
+
 def add_labels(df: pd.DataFrame, horizon: int = LABEL_HORIZON_CANDLES, sl_pct: Optional[float] = None) -> pd.DataFrame:
     """Labels forward Fibonacci expansion tiers reached before SL."""
     if sl_pct is None:
         sl_pct = getattr(settings, 'MAX_RISK_PER_TRADE', DEFAULT_SL_PCT)
-    closes = df['close'].values
-    highs = df['high'].values
-    lows = df['low'].values
-    n = len(df)
+    peak_gain, _ = _forward_peak_gains(df, horizon, sl_pct)
 
-    labels = np.zeros(n, dtype=int)
-    max_gains = np.zeros(n, dtype=float)
+    # Tiers 0..5 for <1%, 1%, 2%, 3%, 5%, 8%+
+    labels = np.searchsorted(FIBONACCI_LEVELS, peak_gain, side='right')
 
-    for i in range(n - horizon):
-        entry = closes[i]
-        sl_price = entry * (1.0 - sl_pct)
-
-        peak_gain = 0.0
-        for j in range(i + 1, i + 1 + horizon):
-            if lows[j] <= sl_price:
-                break
-            gain = (highs[j] - entry) / entry
-            if gain > peak_gain:
-                peak_gain = gain
-
-        max_gains[i] = peak_gain
-
-        tier = 0
-        if peak_gain >= 0.08:
-            tier = 5
-        elif peak_gain >= 0.05:
-            tier = 4
-        elif peak_gain >= 0.03:
-            tier = 3
-        elif peak_gain >= 0.02:
-            tier = 2
-        elif peak_gain >= 0.01:
-            tier = 1
-
-        labels[i] = tier
-
-    out = df.iloc[:n - horizon].copy()
-    out['max_gain'] = max_gains[:n - horizon]
-    out['label'] = labels[:n - horizon]
+    out = df.iloc[:len(peak_gain)].copy()
+    out['max_gain'] = peak_gain
+    out['label'] = labels.astype(int)
     return out.reset_index(drop=True)
 
 
@@ -222,46 +229,14 @@ def label_triple_barrier(df: pd.DataFrame, horizon: int = LABEL_HORIZON_CANDLES,
     """Triple-barrier labeling for spot trades."""
     if sl_pct is None:
         sl_pct = getattr(settings, 'MAX_RISK_PER_TRADE', SL_PCT)
-    closes = df['close'].values
-    highs = df['high'].values
-    lows = df['low'].values
-    n = len(df)
+    peak_gain, stopped_out = _forward_peak_gains(df, horizon, sl_pct)
 
-    labels = np.full(n, -1, dtype=int)
+    # FIB tiers share numbering with add_labels (1..5); below 1% split into SL_FIRST vs TIMEOUT
+    tiers = np.searchsorted(FIBONACCI_LEVELS, peak_gain, side='right')
+    labels = np.where(tiers > 0, tiers, np.where(stopped_out, LABEL_SL_FIRST, LABEL_TIMEOUT))
 
-    for i in range(n - horizon):
-        entry = closes[i]
-        sl_price = entry * (1.0 - sl_pct)
-        stopped_out = False
-        peak_gain = 0.0
-
-        for j in range(i + 1, i + 1 + horizon):
-            if lows[j] <= sl_price:
-                stopped_out = True
-                break
-            gain = (highs[j] - entry) / entry
-            if gain > peak_gain:
-                peak_gain = gain
-
-        if peak_gain >= 0.08:
-            label = LABEL_FIB_8
-        elif peak_gain >= 0.05:
-            label = LABEL_FIB_5
-        elif peak_gain >= 0.03:
-            label = LABEL_FIB_3
-        elif peak_gain >= 0.02:
-            label = LABEL_FIB_2
-        elif peak_gain >= 0.01:
-            label = LABEL_FIB_1
-        elif stopped_out:
-            label = LABEL_SL_FIRST
-        else:
-            label = LABEL_TIMEOUT
-
-        labels[i] = label
-
-    out = df.iloc[:n - horizon].copy()
-    out['barrier_label'] = labels[:n - horizon]
+    out = df.iloc[:len(peak_gain)].copy()
+    out['barrier_label'] = labels.astype(int)
     return out
 
 
@@ -335,6 +310,7 @@ def save_model(model: Any, scaler: Any, encoder: Any, symbol: str, candles_count
             'trained_at': datetime.now(),
             'candles_count': candles_count,
             'symbol': symbol,
+            'feature_version': FEATURE_VERSION,
         }, f)
     print(f"  Model saved to {paths['model']}")
 
@@ -370,6 +346,10 @@ def load_model(symbol: str) -> Tuple[Optional[Any], Optional[Any], Optional[Any]
 
         if not _labels_are_valid(encoder):
             print("  Label set changed, retraining...")
+            return None, None, None, None
+
+        if metadata.get('feature_version') != FEATURE_VERSION:
+            print(f"  Feature definitions changed (v{metadata.get('feature_version', 1)} -> v{FEATURE_VERSION}), retraining...")
             return None, None, None, None
 
         return model, scaler, encoder, metadata
@@ -448,6 +428,7 @@ def save_barrier_model(model: Any, scaler: Any, encoder: Any, symbol: str, candl
             'trained_at': datetime.now(),
             'candles_count': candles_count,
             'label_stats': label_stats,
+            'feature_version': FEATURE_VERSION,
         }, f)
 
 
@@ -466,6 +447,9 @@ def load_barrier_model(symbol: str) -> Tuple[Optional[Any], Optional[Any], Optio
             return None, None, None, None
         if not _labels_are_valid(data['encoder']):
             print("  Label set changed, retraining barrier model...")
+            return None, None, None, None
+        if data.get('feature_version') != FEATURE_VERSION:
+            print(f"  Feature definitions changed (v{data.get('feature_version', 1)} -> v{FEATURE_VERSION}), retraining barrier model...")
             return None, None, None, None
         return data['model'], data['scaler'], data['encoder'], data
     except Exception:
@@ -530,12 +514,13 @@ def generate_signal(model: Any, scaler: Any, encoder: Any, df: pd.DataFrame, min
     scaled = scaler.transform(latest)
 
     proba = model.predict_proba(scaled)[0]
-    pred_enc = model.predict(scaled)[0]
+    pred_enc = int(np.argmax(proba))
     confidence = float(max(proba))
 
     pred = encoder.inverse_transform([pred_enc])[0]
     class_probs = {cls: prob for cls, prob in zip(encoder.classes_, proba)}
     p_bullish = sum(prob for cls, prob in class_probs.items() if cls >= 1)
+    p_sl_first = class_probs.get(LABEL_SL_FIRST, 0.0)
 
     current_price = float(df['close'].iloc[-1])
 
@@ -543,6 +528,7 @@ def generate_signal(model: Any, scaler: Any, encoder: Any, df: pd.DataFrame, min
         'action': None,
         'confidence': confidence,
         'p_bullish': round(p_bullish, 4),
+        'p_sl_first': round(p_sl_first, 4),
         'pred_label': int(pred),
         'fib_tier': int(pred) if pred >= 1 else 0,
         'fib_target_pct': TIER_TO_PCT.get(int(pred), 0.02),
@@ -553,14 +539,24 @@ def generate_signal(model: Any, scaler: Any, encoder: Any, df: pd.DataFrame, min
 
     if pred >= 1 and (confidence >= min_confidence or p_bullish >= 0.45):
         target_pct = TIER_TO_PCT.get(int(pred), 0.03)
-        sl_pct = getattr(settings, 'MAX_RISK_PER_TRADE', SL_PCT)
+        max_sl = getattr(settings, 'MAX_RISK_PER_TRADE', SL_PCT)
+        sl_pct = round(min(target_pct, max_sl), 4)
         signal['action'] = 'BUY'
+        signal['fib_target_pct'] = target_pct
+        signal['tp_pct'] = target_pct
+        signal['sl_pct'] = sl_pct
         signal['take_profit'] = round(current_price * (1.0 + target_pct), 4)
         signal['stop_loss'] = round(current_price * (1.0 - sl_pct), 4)
-    elif pred == -1 and confidence >= min_confidence:
-        sl_pct = getattr(settings, 'MAX_RISK_PER_TRADE', SL_PCT)
+    elif (pred == LABEL_SL_FIRST or pred == -1) and (confidence >= min_confidence or p_sl_first >= 0.45):
+        target_pct = 0.03
+        max_sl = getattr(settings, 'MAX_RISK_PER_TRADE', SL_PCT)
+        sl_pct = round(min(target_pct, max_sl), 4)
         signal['action'] = 'SELL'
+        signal['fib_target_pct'] = target_pct
+        signal['tp_pct'] = target_pct
+        signal['sl_pct'] = sl_pct
         signal['take_profit'] = round(current_price * (1.0 - target_pct), 4)
         signal['stop_loss'] = round(current_price * (1.0 + sl_pct), 4)
+        signal['order_type'] = 'signal_only'
 
     return signal

@@ -5,8 +5,9 @@ Shared state storage wrapper supporting Redis caching with durable SQLite persis
 import json
 import os
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, List, Dict, Any, Iterator, Tuple
 
 from config.settings import settings
 
@@ -54,14 +55,21 @@ class StateStorage:
             # Silently fallback to SQLite without crashing
             # print(f"[StateStorage] Redis unavailable ({e}) -- using SQLite directly")
 
-    def get_db_connection(self) -> sqlite3.Connection:
+    @contextmanager
+    def get_db_connection(self) -> Iterator[sqlite3.Connection]:
+        """Yields a connection that commits on success and is always closed
+        (sqlite3's own `with conn:` only commits, it never closes)."""
         dir_name = os.path.dirname(self.db_path)
         if dir_name:
             os.makedirs(dir_name, exist_ok=True)
         conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL;")
-        return conn
+        try:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL;")
+            with conn:
+                yield conn
+        finally:
+            conn.close()
 
     def init_db(self):
         """Initializes SQLite schema for state management and trade history."""
@@ -253,7 +261,10 @@ class StateStorage:
         return self.get_last_close_time(symbol, "SL Hit")
 
     def get_last_tp_time(self, symbol: str) -> Optional[datetime]:
-        return self.get_last_close_time(symbol, "TP Hit")
+        # The trader applies the TP cooldown after profit-lock exits too
+        times = [t for t in (self.get_last_close_time(symbol, "TP Hit"),
+                             self.get_last_close_time(symbol, "Profit Lock Hit")) if t]
+        return max(times) if times else None
 
     # ── Arbitrary Key-Value Cache ───────────────────────────────
 

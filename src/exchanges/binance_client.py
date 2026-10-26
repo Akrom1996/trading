@@ -75,17 +75,25 @@ class BinanceClient:
         exchange = self.get_exchange()
         all_ohlcv = []
         since = None
-        batches = (limit // 1000) + 1
+        tf_ms = self.timeframe_to_ms(timeframe)
+        remaining = limit
+        i = 0
 
-        for i in range(batches):
+        while remaining > 0:
+            batch_limit = min(remaining, 1000)
             try:
-                ohlcv = exchange.fetch_ohlcv(symbol, timeframe, since=since, limit=1000)
+                if i > 0:
+                    time.sleep(0.5)
+                ohlcv = exchange.fetch_ohlcv(symbol, timeframe, since=since, limit=batch_limit)
                 if not ohlcv:
                     break
 
                 all_ohlcv = ohlcv + all_ohlcv
-                since = ohlcv[0][0] - (1000 * self.timeframe_to_ms(timeframe))
-                time.sleep(0.5)
+                remaining -= len(ohlcv)
+                if len(ohlcv) < batch_limit:
+                    break
+                since = ohlcv[0][0] - (min(remaining, 1000) * tf_ms)
+                i += 1
             except Exception as e:
                 print(f"[BinanceClient] Batch {i} fetch error: {e}")
                 break
