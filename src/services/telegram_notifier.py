@@ -2,6 +2,7 @@
 Telegram notification dispatcher for signals, trade executions, daily limits, and errors.
 """
 
+import html
 from typing import Optional, Dict, Any
 
 try:
@@ -41,6 +42,8 @@ class TelegramNotifier:
                 'parse_mode': 'HTML',
             }
             res = requests.post(url, data=data, timeout=5)
+            if res.status_code != 200:
+                print(f"[TelegramNotifier] Send failed ({res.status_code}): {res.text[:200]}")
             return res.status_code == 200
         except Exception as e:
             print(f"[TelegramNotifier] Error sending message: {e}")
@@ -53,8 +56,10 @@ class TelegramNotifier:
         liq: Optional[Dict[str, Any]] = None,
         level_text: str = '',
         symbol: str = '',
+        chat_id: Optional[str] = None,
     ):
-        emoji = '🟢' if signal.get('action') == 'BUY' else '🔴'
+        is_sell = signal.get('action') == 'SELL'
+        emoji = '🔴' if is_sell else '🟢'
         liq_emoji = '🐻' if liq and liq.get('bias') == 'BEARISH' else '🐂' if liq and liq.get('bias') == 'BULLISH' else '⚖️'
 
         liq_section = ""
@@ -68,35 +73,69 @@ class TelegramNotifier:
             )
 
         fib_target = signal.get('fib_target_pct')
-        fib_str = f" (+{fib_target*100:.0f}% Fib)" if fib_target else ""
+        fib_str = (f" (-{fib_target*100:.0f}%)" if is_sell else f" (+{fib_target*100:.0f}% Fib)") if fib_target else ""
+        sl_target = signal.get('sl_pct')
+        sl_str = (f" (+{sl_target*100:.1f}%)" if is_sell else f" (-{sl_target*100:.1f}%)") if sl_target else ""
+        
         p_bull = signal.get('p_bullish')
-        conf_str = f"{signal.get('confidence', 0):.0%}" + (f" (Bullish: {p_bull:.0%})" if p_bull else "")
-        order_type_str = f" ({signal.get('order_type').upper()})" if signal.get('order_type') else ""
+        if is_sell:
+            p_bear = 1.0 - p_bull if p_bull is not None else signal.get('p_sl_first', signal.get('confidence', 0))
+            conf_str = f"{signal.get('confidence', 0):.0%}" + f" (Bearish: {p_bear:.0%})"
+        else:
+            conf_str = f"{signal.get('confidence', 0):.0%}" + (f" (Bullish: {p_bull:.0%})" if p_bull else "")
+
+        order_type = signal.get('order_type')
+        if order_type == 'signal_only':
+            order_type_str = " (ALERT ONLY)"
+        elif order_type:
+            order_type_str = f" ({order_type.upper()})"
+        else:
+            order_type_str = ""
+
+        warning_section = ""
+        if is_sell:
+            pos_count = signal.get('open_positions_count', 0)
+            pos_warning = f"⚠️ <b>Warning:</b> You currently have <b>{pos_count}</b> open position(s) on {symbol}!\n\n" if pos_count > 0 else ""
+            warning_section = (
+                f"\n\n{pos_warning}"
+                f"ℹ️ <i>Market is turning BEARISH. This is an informational alert — no order placed on Binance.</i>"
+            )
 
         msg = (
             f"{emoji} <b>{signal.get('action')} Signal{order_type_str} — {symbol}</b>\n\n"
-            f"💰 Entry:       <b>{signal.get('entry')}</b>\n"
+            f"💰 Price:       <b>{signal.get('entry')}</b>\n"
             f"🎯 Take Profit: <b>{signal.get('take_profit')}</b>{fib_str}\n"
-            f"🛑 Stop Loss:   <b>{signal.get('stop_loss')}</b>\n"
+            f"🛑 Stop Loss:   <b>{signal.get('stop_loss')}</b>{sl_str}\n"
             f"📊 Confidence:  <b>{conf_str}</b>\n"
             f"🔢 Trade:       <b>{daily_trades}/{settings.MAX_TRADES_PER_DAY}</b>"
             f"{liq_section}"
             f"{level_text}"
+            f"{warning_section}"
         )
-        self.send_message(msg)
+        target_chat = chat_id or (self.error_chat_id if is_sell else self.chat_id)
+        self.send_message(msg, chat_id=target_chat)
 
-    def notify_signal(self, signal: Dict[str, Any], daily_trades: int, symbol: str = 'SOL/USDT'):
-        emoji = '🟢' if signal.get('action') == 'BUY' else '🔴'
-        order_type_str = f" ({signal.get('order_type').upper()})" if signal.get('order_type') else ""
+    def notify_signal(self, signal: Dict[str, Any], daily_trades: int, symbol: str = 'SOL/USDT', chat_id: Optional[str] = None):
+        is_sell = signal.get('action') == 'SELL'
+        emoji = '🔴' if is_sell else '🟢'
+        order_type = signal.get('order_type')
+        order_type_str = " (ALERT ONLY)" if order_type == 'signal_only' else (f" ({order_type.upper()})" if order_type else "")
+        sl_target = signal.get('sl_pct')
+        sl_str = (f" (+{sl_target*100:.1f}%)" if is_sell else f" (-{sl_target*100:.1f}%)") if sl_target else ""
+        fib_target = signal.get('fib_target_pct')
+        fib_str = (f" (-{fib_target*100:.0f}%)" if is_sell else f" (+{fib_target*100:.0f}% Fib)") if fib_target else ""
+        notice = "\n\nℹ️ <i>Market is turning BEARISH. Alert only — not applied to Binance account.</i>" if is_sell else ""
         msg = (
             f"{emoji} <b>{signal.get('action')} Signal{order_type_str} — {symbol}</b>\n\n"
-            f"💰 Entry:       <b>{signal.get('entry')}</b>\n"
-            f"🎯 Take Profit: <b>{signal.get('take_profit')}</b>\n"
-            f"🛑 Stop Loss:   <b>{signal.get('stop_loss')}</b>\n"
+            f"💰 Price:       <b>{signal.get('entry')}</b>\n"
+            f"🎯 Take Profit: <b>{signal.get('take_profit')}</b>{fib_str}\n"
+            f"🛑 Stop Loss:   <b>{signal.get('stop_loss')}</b>{sl_str}\n"
             f"📊 Confidence:  <b>{signal.get('confidence', 0):.0%}</b>\n"
             f"🔢 Trade:       <b>{daily_trades}/{settings.MAX_TRADES_PER_DAY}</b>"
+            f"{notice}"
         )
-        self.send_message(msg)
+        target_chat = chat_id or (self.error_chat_id if is_sell else self.chat_id)
+        self.send_message(msg, chat_id=target_chat)
 
     def notify_retrain(self, candles: int, avg_conf: float, max_conf: float, symbol: str = ''):
         tag = f" — {symbol}" if symbol else ""
@@ -122,7 +161,8 @@ class TelegramNotifier:
         )
 
     def notify_error(self, error: str):
-        self.send_message(f"❌ <b>Bot Error</b>\n<code>{error}</code>", self.error_chat_id)
+        # Exception text can contain <, > or & which break Telegram's HTML parse mode
+        self.send_message(f"❌ <b>Bot Error</b>\n<code>{html.escape(str(error))}</code>", self.error_chat_id)
 
     def notify_start(self, symbol: str):
         self.send_message(f"✅ <b>{symbol} Trading Bot Started</b>", self.error_chat_id)
@@ -158,11 +198,11 @@ def get_notifier() -> TelegramNotifier:
 def send_message(text: str, chat_id: Optional[str] = None) -> bool:
     return get_notifier().send_message(text, chat_id)
 
-def notify_signal_with_liq(signal, daily_trades, liq, level_text='', symbol=''):
-    get_notifier().notify_signal_with_liq(signal, daily_trades, liq, level_text, symbol)
+def notify_signal_with_liq(signal, daily_trades, liq, level_text='', symbol='', chat_id=None):
+    get_notifier().notify_signal_with_liq(signal, daily_trades, liq, level_text, symbol, chat_id=chat_id)
 
-def notify_signal(signal, daily_trades, symbol='SOL/USDT'):
-    get_notifier().notify_signal(signal, daily_trades, symbol)
+def notify_signal(signal, daily_trades, symbol='SOL/USDT', chat_id=None):
+    get_notifier().notify_signal(signal, daily_trades, symbol, chat_id=chat_id)
 
 def notify_retrain(candles, avg_conf, max_conf, symbol=''):
     get_notifier().notify_retrain(candles, avg_conf, max_conf, symbol)

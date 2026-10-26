@@ -23,7 +23,6 @@ from src.exchanges.binance_client import (
     check_order_status,
     cancel_order,
 )
-from src.indicators.technicals import add_features, add_labels
 from src.indicators.heatmap import get_liq_data
 from src.services.redis_cache import (
     init_db,
@@ -35,6 +34,7 @@ from src.services.redis_cache import (
     get_shared_value,
 )
 from src.services.telegram_notifier import (
+    notify_signal,
     notify_signal_with_liq,
     notify_error,
     notify_loss_limit,
@@ -70,11 +70,26 @@ def get_decimal_places(price: float) -> int:
     return 8
 
 
+def calculate_dynamic_sl(tp_pct: float, max_sl: Optional[float] = None) -> float:
+    """
+    Dynamically calculate Stop Loss percentage based on Take Profit:
+    - If TP <= max_sl (e.g. 1%), SL matches TP (1%).
+    - If TP > max_sl (e.g. 5% or 8%), SL is capped at max_sl (3%).
+    Formula: min(tp_pct, max_sl)
+    """
+    cap = max_sl if max_sl is not None else getattr(settings, 'MAX_RISK_PER_TRADE', 0.03)
+    return round(min(tp_pct, cap), 4)
+
+
 def normalize_position(pos: dict, decimals: int, symbol: str) -> dict:
     if 'take_profit' not in pos:
         pos['take_profit'] = round(pos['entry'] * (1 + TP_PCT), decimals)
+    if 'tp_pct' not in pos:
+        pos['tp_pct'] = round((pos['take_profit'] - pos['entry']) / pos['entry'], 4) if pos.get('entry') else TP_PCT
+    if 'sl_pct' not in pos:
+        pos['sl_pct'] = calculate_dynamic_sl(pos.get('tp_pct', TP_PCT))
     if 'stop_loss' not in pos:
-        pos['stop_loss'] = round(pos['entry'] * (1 - settings.MAX_RISK_PER_TRADE), decimals)
+        pos['stop_loss'] = round(pos['entry'] * (1 - pos['sl_pct']), decimals)
     if 'pyramided' not in pos:
         pos['pyramided'] = True
     if 'status' not in pos:
@@ -221,11 +236,15 @@ def open_position(price: float, tp_pct: float, sl_pct: float, now: datetime,
         return pos
 
 
-def retrain_and_save(symbol: str):
+def fetch_training_features(symbol: str) -> pd.DataFrame:
     print(f"[{symbol}] Fetching {settings.TRAIN_CANDLES} candles...")
-    df = fetch_ohlcv(symbol, '5m', limit=settings.TRAIN_CANDLES)
-    df = add_features(df)
-    df = add_labels(df)
+    return add_features(fetch_ohlcv(symbol, '5m', limit=settings.TRAIN_CANDLES))
+
+
+def retrain_and_save(symbol: str, df_features: Optional[pd.DataFrame] = None):
+    if df_features is None:
+        df_features = fetch_training_features(symbol)
+    df = add_labels(df_features)
     print(f"  Candles loaded : {len(df)}")
     print("Training model...")
     model, scaler, encoder = train_model(df)
@@ -233,9 +252,8 @@ def retrain_and_save(symbol: str):
     return model, scaler, encoder
 
 
-def retrain_barrier_and_save(symbol: str):
-    df_barrier = fetch_ohlcv(symbol, '5m', limit=settings.TRAIN_CANDLES)
-    df_barrier = add_features(df_barrier)
+def retrain_barrier_and_save(symbol: str, df_features: Optional[pd.DataFrame] = None):
+    df_barrier = df_features if df_features is not None else fetch_training_features(symbol)
     barrier_model, barrier_scaler, barrier_encoder, label_stats = train_barrier_model(df_barrier, symbol=symbol)
     save_barrier_model(barrier_model, barrier_scaler, barrier_encoder, symbol=symbol, candles_count=len(df_barrier), label_stats=label_stats)
 
@@ -303,6 +321,8 @@ def run_coin_trader(symbol: Optional[str] = None):
     last_retrain = datetime.now()
     last_day = datetime.now().day
     limit_notice_sent = False
+    loss_limit_notice_sent = False
+    last_sell_alert_time: Optional[datetime] = None
 
     last_sl_time = get_last_sl_time(symbol)
     if last_sl_time is not None:
@@ -334,6 +354,7 @@ def run_coin_trader(symbol: Optional[str] = None):
             daily_pnl = 0.0
             last_day = now.day
             limit_notice_sent = False
+            loss_limit_notice_sent = False
             print(f"[{symbol}] [{now.strftime('%H:%M')}] Daily counters reset (holding {len(open_positions)} positions)")
             holding_msg = f"\nHolding <b>{len(open_positions)}</b> open position(s) into the new day." if open_positions else ""
             send_message(f"🔄 <b>[{symbol}] Daily counters reset</b>{holding_msg}")
@@ -342,17 +363,26 @@ def run_coin_trader(symbol: Optional[str] = None):
         # Periodic Retrain
         if (now - last_retrain).total_seconds() / 60 >= 60:
             print(f"[{symbol}] [{now.strftime('%H:%M')}] Retraining models...")
+            # Advance the timer even on failure so a broken retrain doesn't re-run every loop
+            last_retrain = now
             try:
-                model, scaler, encoder = retrain_and_save(symbol)
-                last_retrain = now
+                df_train = fetch_training_features(symbol)
             except Exception as e:
-                notify_error(f"[{symbol}] Retrain failed: {e}")
+                df_train = None
+                notify_error(f"[{symbol}] Training data fetch failed: {e}")
 
-            try:
-                barrier_model, barrier_scaler, barrier_encoder = retrain_barrier_and_save(symbol)
-            except Exception as e:
-                notify_error(f"[{symbol}] Barrier retrain failed: {e}")
+            if df_train is not None:
+                try:
+                    model, scaler, encoder = retrain_and_save(symbol, df_train)
+                except Exception as e:
+                    notify_error(f"[{symbol}] Retrain failed: {e}")
 
+                try:
+                    barrier_model, barrier_scaler, barrier_encoder = retrain_barrier_and_save(symbol, df_train)
+                except Exception as e:
+                    notify_error(f"[{symbol}] Barrier retrain failed: {e}")
+
+        # Without fresh market data every step below would act on a stale (or undefined) price
         try:
             df_recent = fetch_ohlcv(symbol, '5m', limit=2)
             latest_candle = df_recent.iloc[-1]
@@ -360,7 +390,12 @@ def run_coin_trader(symbol: Optional[str] = None):
             candle_low = float(latest_candle['low'])
             current_price = float(latest_candle['close'])
             decimals = get_decimal_places(current_price)
+        except Exception as e:
+            print(f"[{symbol}] [{now.strftime('%H:%M')}] Market data fetch error: {e}")
+            time.sleep(60)
+            continue
 
+        try:
             # Step 1: Advance pending limit-buy orders
             state_changed = False
             still_pending = []
@@ -418,7 +453,9 @@ def run_coin_trader(symbol: Optional[str] = None):
                         pos['oco_order_id'] = None
                         protect_position(pos, symbol)
                     # 'open' / 'unknown' -> do nothing this loop
-                    continue
+                    # 'dry_run' -> no real OCO exists, fall through to candle logic
+                    if state != 'dry_run':
+                        continue
 
                 if candle_high >= pos['take_profit']:
                     daily_pnl = close_position(pos, pos['take_profit'], "TP Hit (Candle High)", daily_pnl, symbol)
@@ -463,9 +500,12 @@ def run_coin_trader(symbol: Optional[str] = None):
                 # Step 2 will reconcile it if the OCO actually filled.
                 if real and pos.get('oco_order_id'):
                     try:
-                        cancel_oco(symbol, pos['oco_order_id'])
+                        canceled = cancel_oco(symbol, pos['oco_order_id'])
                     except Exception as e:
-                        notify_error(f"[{symbol}] Profit lock skipped, cancel_oco failed: {e}")
+                        canceled = False
+                        print(f"[{symbol}] cancel_oco raised: {e}")
+                    if not canceled:
+                        notify_error(f"[{symbol}] Profit lock skipped, cancel_oco failed for {pos['oco_order_id']}")
                         continue
                     pos['oco_order_id'] = None
                     time.sleep(0.3)
@@ -513,9 +553,10 @@ def run_coin_trader(symbol: Optional[str] = None):
                     pos['pyramided'] = True
 
                     if still_bullish:
-                        new_entry = round(current_price * (1 - settings.ENTRY_OFFSET_PCT * 2), decimals)
+                        new_entry = round(current_price * (1 - settings.ENTRY_OFFSET_PCT * 4), decimals)
                         rung_tp_pct = pyr_barrier_probs.get('recommended_tp', TP_PCT)
-                        new_pos = open_position(new_entry, rung_tp_pct, settings.MAX_RISK_PER_TRADE, now, 'pyramid entry', symbol, is_pyramid=True)
+                        rung_sl_pct = calculate_dynamic_sl(rung_tp_pct)
+                        new_pos = open_position(new_entry, rung_tp_pct, rung_sl_pct, now, 'pyramid entry', symbol, is_pyramid=True)
                         open_positions.append(new_pos)
 
                         daily_trades += 1
@@ -524,7 +565,7 @@ def run_coin_trader(symbol: Optional[str] = None):
                             f"🔼 <b>[{symbol}] Pyramid entry #{len(open_positions)}{virtual_tag}</b>\n\n"
                             f"💰 Entry: <b>{new_entry}</b>\n"
                             f"🎯 TP:    <b>{new_pos['take_profit']} (+{rung_tp_pct*100:.1f}% Fib)</b>\n"
-                            f"🛑 SL:    <b>{new_pos['stop_loss']}</b>\n"
+                            f"🛑 SL:    <b>{new_pos['stop_loss']} (-{rung_sl_pct*100:.1f}%)</b>\n"
                             f"📊 {reason}"
                         )
                     save_bot_state(symbol, open_positions, daily_trades, daily_pnl, last_day)
@@ -555,9 +596,12 @@ def run_coin_trader(symbol: Optional[str] = None):
             limit_notice_sent = False
 
         if daily_pnl <= -settings.MAX_DAILY_LOSS:
-            notify_loss_limit(symbol)
-            print(f"[{symbol}] Daily loss limit hit, stopping for today...")
-            time.sleep(3600)
+            # Stop new entries only; keep looping every minute so open positions stay monitored
+            if not loss_limit_notice_sent:
+                notify_loss_limit(symbol)
+                loss_limit_notice_sent = True
+            print(f"[{symbol}] [{now.strftime('%H:%M')}] Daily loss limit hit, no new entries today")
+            time.sleep(60)
             continue
 
         if last_sl_time is not None:
@@ -597,12 +641,8 @@ def run_coin_trader(symbol: Optional[str] = None):
                 print(f"[{symbol}] [{now.strftime('%H:%M')}] BTC macro is BEARISH. Skipping {symbol} BUY signal.")
                 signal['action'] = None
 
-            # Ignore SELL signals
-            if signal.get('action') == 'SELL':
-                signal['action'] = None
-
             # -------------------------------------------------------------
-            # STEP 2: CHECK LIQUIDATIONS & BARRIER MODEL (Only if still BUY)
+            # STEP 2: CHECK LIQUIDATIONS & BARRIER MODEL
             # -------------------------------------------------------------
             coin = symbol.split('/')[0]
             liq, levels = get_liq_data(coin, current_price)
@@ -631,6 +671,12 @@ def run_coin_trader(symbol: Optional[str] = None):
                 if not enter:
                     signal['action'] = None
 
+            elif signal.get('action') == 'SELL' and barrier_model is not None:
+                try:
+                    barrier_probs = predict_barrier_probabilities(barrier_model, barrier_scaler, barrier_encoder, df)
+                except Exception:
+                    pass
+
             # -------------------------------------------------------------
             # STEP 3: CALCULATE ENTRY / TP / SL & EXECUTE ORDER
             # -------------------------------------------------------------
@@ -638,6 +684,7 @@ def run_coin_trader(symbol: Optional[str] = None):
                 model_tp = signal.get('fib_target_pct', 0.03)
                 barrier_tp = barrier_probs.get('recommended_tp', 0.03) if barrier_model is not None else model_tp
                 effective_tp = max(model_tp, barrier_tp)
+                effective_sl = calculate_dynamic_sl(effective_tp)
 
                 if btc_bias == 'BULLISH':
                     entry_price = current_price
@@ -648,8 +695,22 @@ def run_coin_trader(symbol: Optional[str] = None):
 
                 signal['entry'] = entry_price
                 signal['take_profit'] = round(entry_price * (1 + effective_tp), decimals)
-                signal['stop_loss'] = round(entry_price * (1 - settings.MAX_RISK_PER_TRADE), decimals)
+                signal['stop_loss'] = round(entry_price * (1 - effective_sl), decimals)
+                signal['tp_pct'] = effective_tp
+                signal['sl_pct'] = effective_sl
                 signal['order_type'] = order_type
+
+            elif signal.get('action') == 'SELL':
+                target_pct = signal.get('fib_target_pct', 0.03)
+                max_sl = getattr(settings, 'MAX_RISK_PER_TRADE', 0.03)
+                effective_sl = calculate_dynamic_sl(target_pct, max_sl)
+                signal['entry'] = current_price
+                signal['take_profit'] = round(current_price * (1 - target_pct), decimals)
+                signal['stop_loss'] = round(current_price * (1 + effective_sl), decimals)
+                signal['tp_pct'] = target_pct
+                signal['sl_pct'] = effective_sl
+                signal['order_type'] = 'signal_only'
+                signal['open_positions_count'] = len(open_positions)
 
             liq_info = f"Liq: {liq['bias']} ({liq['liq_ratio']:.0%})" if liq else "Liq: N/A"
             btc_info = f"BTC: {btc_bias}"
@@ -663,6 +724,7 @@ def run_coin_trader(symbol: Optional[str] = None):
             )
 
             if signal.get('action') == 'BUY':
+                last_sell_alert_time = None
                 level_text = ""
                 if levels:
                     level_text = "\n\n🗺 <b>Nearby Liq Levels:</b>\n"
@@ -670,17 +732,47 @@ def run_coin_trader(symbol: Optional[str] = None):
                         level_text += (f"  {'⬆️' if lv['direction'] == 'ABOVE' else '⬇️'} "
                                        f"${lv['price']} ({lv['distance']}% away — ${lv['amount']:,.0f})\n")
 
-                notify_signal_with_liq(signal, daily_trades + 1, liq, level_text, symbol=symbol)
+                notify_signal(signal, daily_trades + 1, symbol=symbol)
 
                 order_label = f"fresh {order_type} entry"
                 new_pos = open_position(
-                    entry_price, effective_tp, settings.MAX_RISK_PER_TRADE, now,
+                    entry_price, effective_tp, effective_sl, now,
                     order_label, symbol, order_type=order_type
                 )
 
                 open_positions.append(new_pos)
                 daily_trades += 1
                 save_bot_state(symbol, open_positions, daily_trades, daily_pnl, last_day)
+
+            elif signal.get('action') == 'SELL':
+                # ── Notification Alert Only (DO NOT execute on Binance) ──
+                cooldown_sec = getattr(settings, 'SELL_ALERT_COOLDOWN_MINUTES', 30.0) * 60
+                can_alert = (
+                    last_sell_alert_time is None
+                    or (now - last_sell_alert_time).total_seconds() >= cooldown_sec
+                )
+                if can_alert:
+                    level_text = ""
+                    if levels:
+                        level_text = "\n\n🗺 <b>Nearby Liq Levels:</b>\n"
+                        for lv in levels[:3]:
+                            level_text += (f"  {'⬆️' if lv['direction'] == 'ABOVE' else '⬇️'} "
+                                           f"${lv['price']} ({lv['distance']}% away — ${lv['amount']:,.0f})\n")
+
+                    notify_signal_with_liq(
+                        signal,
+                        daily_trades,
+                        liq,
+                        level_text,
+                        symbol=symbol,
+                        chat_id=settings.TELEGRAM_ERROR_CHAT_ID,
+                    )
+                    last_sell_alert_time = now
+                    print(f"[{symbol}] [{now.strftime('%H:%M')}] 🔴 Sent SELL alert (signal only — not executed on Binance)")
+                else:
+                    secs_left = cooldown_sec - (now - last_sell_alert_time).total_seconds()
+                    mins_left = int(secs_left // 60) + 1
+                    print(f"[{symbol}] [{now.strftime('%H:%M')}] SELL signal active (throttled, {mins_left}m alert cooldown remaining)")
         except Exception as e:
             notify_error(f"[{symbol}] {e}")
             print(f"[{symbol}] [{now.strftime('%H:%M')}] Error: {e}")

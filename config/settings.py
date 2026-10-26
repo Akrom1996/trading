@@ -37,8 +37,9 @@ try:
         ENTRY_OFFSET_PCT: float = Field(default=0.003, description="Limit buy offset below current market price (0.3%)")
         SL_COOLDOWN_MINUTES: float = Field(default=30.0, description="Cooldown period after a Stop Loss hit in minutes")
         TP_COOLDOWN_MINUTES: float = Field(default=10.0, description="Cooldown period after a Take Profit hit in minutes")
+        SELL_ALERT_COOLDOWN_MINUTES: float = Field(default=30.0, description="Cooldown period between Telegram SELL alerts in minutes")
         MAX_TRADES_PER_DAY: int = Field(default=10, description="Maximum entries allowed per 24h cycle")
-        MAX_RISK_PER_TRADE: float = Field(default=0.02, description="Maximum risk per trade (fraction)")
+        MAX_RISK_PER_TRADE: float = Field(default=0.03, description="Maximum risk per trade (fraction)")
         MAX_DAILY_LOSS: float = Field(default=6.0, description="Maximum daily loss percentage before stopping")
 
         # Profit Lock & Trailing Protection
@@ -97,8 +98,9 @@ except ImportError:
             self.ENTRY_OFFSET_PCT = float(os.getenv("ENTRY_OFFSET_PCT", "0.003"))
             self.SL_COOLDOWN_MINUTES = float(os.getenv("SL_COOLDOWN_MINUTES", "30.0"))
             self.TP_COOLDOWN_MINUTES = float(os.getenv("TP_COOLDOWN_MINUTES", "10.0"))
+            self.SELL_ALERT_COOLDOWN_MINUTES = float(os.getenv("SELL_ALERT_COOLDOWN_MINUTES", "30.0"))
             self.MAX_TRADES_PER_DAY = int(os.getenv("MAX_TRADES_PER_DAY", "10"))
-            self.MAX_RISK_PER_TRADE = float(os.getenv("MAX_RISK_PER_TRADE", "0.02"))
+            self.MAX_RISK_PER_TRADE = float(os.getenv("MAX_RISK_PER_TRADE", "0.03"))
             self.MAX_DAILY_LOSS = float(os.getenv("MAX_DAILY_LOSS", "6.0"))
 
             self.PROFIT_LOCK_TRIGGER_PCT = float(os.getenv("PROFIT_LOCK_TRIGGER_PCT", "0.01"))
