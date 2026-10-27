@@ -553,7 +553,7 @@ def run_coin_trader(symbol: Optional[str] = None):
                     pos['pyramided'] = True
 
                     if still_bullish:
-                        new_entry = round(current_price * (1 - settings.ENTRY_OFFSET_PCT * 4), decimals)
+                        new_entry = round(current_price * (1 - settings.ENTRY_OFFSET_PCT * 1.5), decimals)
                         rung_tp_pct = pyr_barrier_probs.get('recommended_tp', TP_PCT)
                         rung_sl_pct = calculate_dynamic_sl(rung_tp_pct)
                         new_pos = open_position(new_entry, rung_tp_pct, rung_sl_pct, now, 'pyramid entry', symbol, is_pyramid=True)
