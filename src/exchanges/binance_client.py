@@ -9,6 +9,8 @@ import pandas as pd
 
 from config.settings import settings
 
+_HISTORY_PAGE_ATTEMPTS = 3
+
 
 class BinanceClient:
     """
@@ -44,6 +46,7 @@ class BinanceClient:
             'secret': self.api_secret or '',
             'enableRateLimit': True,
             'options': {'defaultType': 'spot'},
+            'timeout': int(settings.HTTP_TIMEOUT_SEC * 1000),
         })
 
         if self.testnet:
@@ -125,6 +128,60 @@ class BinanceClient:
         exchange = self.get_exchange()
         return exchange.fetch_order_book(symbol, limit=limit)
 
+    def fetch_ohlcv_history(self, symbol: str, timeframe: str = '5m', total: int = 12000) -> pd.DataFrame:
+        """
+        Fetches the last `total` candles, paging forward (max 1000 per request) with rate-limit
+        sleeps, per-page retries and timestamp dedup. Safe for long histories (walk-forward).
+        """
+        exchange = self.get_exchange()
+        tf_ms = self.timeframe_to_ms(timeframe)
+        since = exchange.milliseconds() - total * tf_ms
+        pause = max(getattr(exchange, 'rateLimit', 50) / 1000, 0.2)
+        rows: List[list] = []
+
+        while len(rows) < total:
+            batch = None
+            for attempt in range(1, _HISTORY_PAGE_ATTEMPTS + 1):
+                try:
+                    batch = exchange.fetch_ohlcv(symbol, timeframe, since=since, limit=1000)
+                    break
+                except Exception as e:
+                    print(f"[BinanceClient] History page fetch error (attempt {attempt}): {e}")
+                    time.sleep(pause * 2 ** attempt)
+            if not batch:
+                break
+            rows.extend(batch)
+            next_since = batch[-1][0] + tf_ms
+            if next_since <= since or len(batch) < 1000:
+                break
+            since = next_since
+            time.sleep(pause)
+
+        df = pd.DataFrame(rows, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        if df.empty:
+            return df
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        df = df.drop_duplicates('timestamp').sort_values('timestamp').reset_index(drop=True)
+        return df.tail(total).reset_index(drop=True)
+
+    def _has_market(self, symbol: str) -> bool:
+        try:
+            return symbol in (self.get_exchange().markets or {})
+        except Exception:
+            return False
+
+    def price_to_precision(self, symbol: str, price: float) -> float:
+        """Price rounded to the symbol's tick size (falls back to 8 decimals if markets aren't loaded)."""
+        if self._has_market(symbol):
+            return float(self.get_exchange().price_to_precision(symbol, price))
+        return round(float(price), 8)
+
+    def amount_to_precision(self, symbol: str, amount: float) -> float:
+        """Amount rounded to the symbol's step size (falls back to 6 decimals if markets aren't loaded)."""
+        if self._has_market(symbol):
+            return float(self.get_exchange().amount_to_precision(symbol, amount))
+        return round(float(amount), 6)
+
     def get_min_notional(self, symbol: str) -> Optional[float]:
         """Exchange minimum order value (quote currency) for a symbol, or None if unknown."""
         try:
@@ -168,9 +225,9 @@ class BinanceClient:
                     f"{quote_amount:.2f} {quote_asset} required."
                 )
 
-        formatted_price = float(exchange.price_to_precision(symbol, limit_price)) if not self.dry_run else limit_price
+        formatted_price = self.price_to_precision(symbol, limit_price)
         raw_amount = quote_amount / formatted_price
-        formatted_amount = float(exchange.amount_to_precision(symbol, raw_amount)) if not self.dry_run else round(raw_amount, 6)
+        formatted_amount = self.amount_to_precision(symbol, raw_amount)
 
         if self.dry_run:
             print(f"[BinanceClient] 🧪 DRY_RUN limit buy: {formatted_amount} {symbol.split('/')[0]} @ {formatted_price} (~{quote_amount:.2f} USDT)")
@@ -443,7 +500,7 @@ class BinanceClient:
     def place_market_sell(self, symbol: str, base_amount: float) -> Dict[str, Any]:
         """Direct market sell for immediate position liquidation."""
         exchange = self.get_exchange()
-        formatted_amount = float(exchange.amount_to_precision(symbol, base_amount)) if not self.dry_run else round(base_amount, 6)
+        formatted_amount = self.amount_to_precision(symbol, base_amount)
 
         if self.dry_run:
             try:
@@ -516,3 +573,13 @@ def cancel_oco(symbol: str, oco_id: Any) -> bool:
 
 def get_min_notional(symbol: str) -> Optional[float]:
     return get_binance_client().get_min_notional(symbol)
+
+def fetch_ohlcv_history(symbol: str, timeframe: str = '5m', total: int = 12000,
+                        client: Optional[BinanceClient] = None) -> pd.DataFrame:
+    return (client or get_binance_client()).fetch_ohlcv_history(symbol, timeframe, total)
+
+def price_to_precision(symbol: str, price: float) -> float:
+    return get_binance_client().price_to_precision(symbol, price)
+
+def amount_to_precision(symbol: str, amount: float) -> float:
+    return get_binance_client().amount_to_precision(symbol, amount)

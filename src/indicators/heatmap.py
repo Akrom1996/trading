@@ -317,7 +317,7 @@ class MultiExchangeLiquidationTracker(_SocketRunner):
             url = f"https://{host}/api/v5/public/instruments?instType=SWAP&instId={self.okx_inst}"
             req = urllib.request.Request(url, headers={"User-Agent": _HTTP_USER_AGENT})
             try:
-                with urllib.request.urlopen(req, timeout=5) as r:
+                with urllib.request.urlopen(req, timeout=settings.HTTP_TIMEOUT_SEC) as r:
                     data = json.load(r).get("data") or []
                 if not data:
                     log.warning("[liq:%s] %s is not listed on OKX", self.base_symbol, self.okx_inst)
