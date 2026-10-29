@@ -67,6 +67,15 @@ try:
         LIQ_MIN_NOTIONAL_USD: float = Field(default=20000.0, description="Min liquidation notional in window before a liq bias is trusted")
         CHOP_ALERT_COOLDOWN_MINUTES: Optional[int] = Field(default=None, description="Cooldown between CHOP alerts (falls back to SELL_ALERT_COOLDOWN_MINUTES)")
 
+        # Live guard / state / BTC regime
+        REQUIRE_POSITIVE_OOS: bool = Field(default=True, description="Only place real entries when the barrier model's out-of-sample edge is proven")
+        MIN_OOS_TRADES: int = Field(default=30, description="Min out-of-sample entries before the OOS edge is trusted")
+        MIN_OOS_AVG_RETURN: float = Field(default=0.0, description="Out-of-sample avg net return (fraction) must exceed this to trade live")
+        REDIS_CONNECT_RETRIES: int = Field(default=10, description="Redis connection attempts at startup when REDIS_URL is set")
+        REDIS_RETRY_DELAY_SEC: float = Field(default=3.0, description="Base delay between Redis connection attempts (multiplied by attempt number)")
+        BTC_REGIME_MAX_AGE_MIN: int = Field(default=15, description="BTC macro regime older than this is treated as UNKNOWN")
+        BTC_REGIME_REQUIRED: bool = Field(default=True, description="Block new entries while the BTC macro regime is UNKNOWN")
+
         # Database & Cache Persistence
         DB_PATH: str = Field(default="data/bot_data.db", description="Path to SQLite database")
         REDIS_URL: Optional[str] = Field(default=None, description="Redis connection URL (optional)")
@@ -137,6 +146,14 @@ except ImportError:
             self.LIQ_MIN_NOTIONAL_USD = float(os.getenv("LIQ_MIN_NOTIONAL_USD", "20000"))
             _chop_cd = os.getenv("CHOP_ALERT_COOLDOWN_MINUTES")
             self.CHOP_ALERT_COOLDOWN_MINUTES = int(_chop_cd) if _chop_cd else None
+
+            self.REQUIRE_POSITIVE_OOS = _parse_bool(os.getenv("REQUIRE_POSITIVE_OOS"), True)
+            self.MIN_OOS_TRADES = int(os.getenv("MIN_OOS_TRADES", "30"))
+            self.MIN_OOS_AVG_RETURN = float(os.getenv("MIN_OOS_AVG_RETURN", "0.0"))
+            self.REDIS_CONNECT_RETRIES = int(os.getenv("REDIS_CONNECT_RETRIES", "10"))
+            self.REDIS_RETRY_DELAY_SEC = float(os.getenv("REDIS_RETRY_DELAY_SEC", "3"))
+            self.BTC_REGIME_MAX_AGE_MIN = int(os.getenv("BTC_REGIME_MAX_AGE_MIN", "15"))
+            self.BTC_REGIME_REQUIRED = _parse_bool(os.getenv("BTC_REGIME_REQUIRED"), True)
 
             self.DB_PATH = os.getenv("DB_PATH", "data/bot_data.db")
             self.REDIS_URL = os.getenv("REDIS_URL")

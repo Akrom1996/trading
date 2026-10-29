@@ -5,6 +5,7 @@ Shared state storage wrapper supporting Redis caching with durable SQLite persis
 import json
 import os
 import sqlite3
+import time
 from contextlib import contextmanager
 from datetime import datetime
 from typing import Optional, List, Dict, Any, Iterator, Tuple
@@ -16,10 +17,14 @@ try:
 except ImportError:
     redis = None
 
+_MAX_REDIS_RETRY_DELAY = 30.0
+_REDIS_RECONNECT_EVERY = 60.0
+
 
 class StateStorage:
     """
     Unified state storage combining Redis fast memory cache with SQLite persistent storage.
+    SQLite is the source of truth for bot state; Redis is a cache and the shared key-value bus.
     """
 
     def __init__(
@@ -28,32 +33,68 @@ class StateStorage:
         redis_url: Optional[str] = None,
         redis_host: Optional[str] = None,
         redis_port: Optional[int] = None,
+        connect_retries: Optional[int] = None,
     ):
         self.db_path = db_path or settings.DB_PATH
         self.redis_url = redis_url or settings.REDIS_URL
         self.redis_host = redis_host or settings.REDIS_HOST
         self.redis_port = redis_port or settings.REDIS_PORT
         self.redis_client = None
-        self._init_redis()
+        self._last_redis_attempt = 0.0
+        self._init_redis(connect_retries)
         self.init_db()
 
-    def _init_redis(self):
-        """Attempts connection to Redis if client library and config are available."""
+    def _make_redis_client(self) -> Any:
+        if self.redis_url:
+            return redis.from_url(self.redis_url, decode_responses=True, socket_timeout=2)
+        return redis.Redis(host=self.redis_host, port=self.redis_port, decode_responses=True, socket_timeout=2)
+
+    def _connect_redis_once(self) -> bool:
+        self._last_redis_attempt = time.monotonic()
+        try:
+            client = self._make_redis_client()
+            client.ping()
+            self.redis_client = client
+            return True
+        except Exception:
+            self.redis_client = None
+            return False
+
+    def _init_redis(self, connect_retries: Optional[int] = None):
+        """
+        Connects to Redis with retries. Retries only apply when REDIS_URL is configured
+        (Docker), so local runs without Redis don't stall at startup.
+        """
         if redis is None:
             return
 
-        try:
-            if self.redis_url:
-                client = redis.from_url(self.redis_url, decode_responses=True, socket_timeout=2)
-            else:
-                client = redis.Redis(host=self.redis_host, port=self.redis_port, decode_responses=True, socket_timeout=2)
-            client.ping()
-            self.redis_client = client
-            print("[StateStorage] ⚡ Connected to Redis shared cache")
-        except Exception as e:
-            self.redis_client = None
-            # Silently fallback to SQLite without crashing
-            # print(f"[StateStorage] Redis unavailable ({e}) -- using SQLite directly")
+        if connect_retries is None:
+            connect_retries = settings.REDIS_CONNECT_RETRIES if self.redis_url else 1
+        attempts = max(1, connect_retries)
+        for attempt in range(1, attempts + 1):
+            if self._connect_redis_once():
+                print("[StateStorage] ⚡ Connected to Redis shared cache")
+                return
+            if attempt < attempts:
+                time.sleep(min(settings.REDIS_RETRY_DELAY_SEC * attempt, _MAX_REDIS_RETRY_DELAY))
+        print(f"[StateStorage] ⚠️ Redis unavailable after {attempts} tries — using SQLite only")
+
+    def _ensure_redis(self):
+        """Lazy reconnect, at most once per _REDIS_RECONNECT_EVERY seconds."""
+        if self.redis_client is not None or redis is None:
+            return
+        if time.monotonic() - self._last_redis_attempt < _REDIS_RECONNECT_EVERY:
+            return
+        if self._connect_redis_once():
+            print("[StateStorage] ⚡ Reconnected to Redis shared cache")
+
+    def _redis_failed(self, what: str, e: Exception):
+        print(f"[StateStorage] Redis {what} error: {e}")
+        if redis is not None and isinstance(e, (redis.ConnectionError, redis.TimeoutError)):
+            self.redis_client = None   # lazy reconnect takes over
+
+    def redis_connected(self) -> bool:
+        return self.redis_client is not None
 
     @contextmanager
     def get_db_connection(self) -> Iterator[sqlite3.Connection]:
@@ -99,7 +140,24 @@ class StateStorage:
                     closed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            self._migrate_trade_date(cursor)
             conn.commit()
+
+    @staticmethod
+    def _migrate_trade_date(cursor: sqlite3.Cursor):
+        """Adds symbol_state.trade_date (YYYY-MM-DD) to old databases and backfills it from updated_at."""
+        columns = {row[1] for row in cursor.execute("PRAGMA table_info(symbol_state)")}
+        if "trade_date" not in columns:
+            try:
+                cursor.execute("ALTER TABLE symbol_state ADD COLUMN trade_date TEXT")
+            except sqlite3.OperationalError as e:
+                # Several bots share this DB; another one may have migrated it first
+                if "duplicate column" not in str(e).lower():
+                    raise
+        cursor.execute("""
+            UPDATE symbol_state SET trade_date = substr(updated_at, 1, 10)
+            WHERE trade_date IS NULL AND updated_at IS NOT NULL
+        """)
 
     # ── State Persistence (symbol_state) ────────────────────────
 
@@ -109,31 +167,34 @@ class StateStorage:
         open_positions: List[Dict[str, Any]],
         daily_trades: int,
         daily_pnl: float,
-        day: int,
+        trade_date: str,
     ):
-        """Saves runtime state to SQLite and updates Redis cache."""
+        """Saves runtime state to SQLite (source of truth) and updates the Redis cache."""
         now_iso = datetime.now().isoformat()
         positions_json = json.dumps(open_positions)
+        day = int(trade_date[8:10])  # legacy column, kept for old readers
 
         # 1. Update SQLite
         with self.get_db_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
                 """
-                INSERT INTO symbol_state (symbol, open_positions, daily_trades, daily_pnl, day, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO symbol_state (symbol, open_positions, daily_trades, daily_pnl, day, trade_date, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(symbol) DO UPDATE SET
                     open_positions=excluded.open_positions,
                     daily_trades=excluded.daily_trades,
                     daily_pnl=excluded.daily_pnl,
                     day=excluded.day,
+                    trade_date=excluded.trade_date,
                     updated_at=excluded.updated_at
                 """,
-                (symbol, positions_json, daily_trades, daily_pnl, day, now_iso),
+                (symbol, positions_json, daily_trades, daily_pnl, day, trade_date, now_iso),
             )
             conn.commit()
 
-        # 2. Update Redis if connected
+        # 2. Update Redis cache; a failure here never fails the save
+        self._ensure_redis()
         if self.redis_client:
             try:
                 state_data = {
@@ -141,46 +202,77 @@ class StateStorage:
                     "daily_trades": daily_trades,
                     "daily_pnl": daily_pnl,
                     "day": day,
+                    "trade_date": trade_date,
                     "updated_at": now_iso,
                 }
                 self.redis_client.set(f"bot_state:{symbol}", json.dumps(state_data))
             except Exception as e:
-                print(f"[StateStorage] Redis cache write error: {e}")
+                self._redis_failed("cache write", e)
 
-    def load_bot_state(self, symbol: str) -> Tuple[List[Dict[str, Any]], int, float, Optional[int]]:
-        """Loads state for a symbol, checking Redis first then SQLite."""
-        # 1. Try Redis cache
+    @staticmethod
+    def _parse_ts(value: Any) -> datetime:
+        try:
+            return datetime.fromisoformat(str(value))
+        except (TypeError, ValueError):
+            return datetime.min
+
+    def load_bot_state(self, symbol: str) -> Tuple[List[Dict[str, Any]], int, float, Optional[str], str]:
+        """
+        Returns (open_positions, daily_trades, daily_pnl, trade_date, source).
+        Reads SQLite always and the Redis copy if present; the newer updated_at wins.
+        """
+        candidates: Dict[str, Dict[str, Any]] = {}
+
+        with self.get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT open_positions, daily_trades, daily_pnl, trade_date, updated_at FROM symbol_state WHERE symbol = ?",
+                (symbol,),
+            )
+            row = cursor.fetchone()
+            if row:
+                candidates["sqlite"] = {
+                    "open_positions": json.loads(row["open_positions"]),
+                    "daily_trades": int(row["daily_trades"]),
+                    "daily_pnl": float(row["daily_pnl"]),
+                    "trade_date": row["trade_date"] or (str(row["updated_at"])[:10] if row["updated_at"] else None),
+                    "updated_at": row["updated_at"],
+                }
+
+        self._ensure_redis()
         if self.redis_client:
             try:
                 cached = self.redis_client.get(f"bot_state:{symbol}")
                 if cached:
                     data = json.loads(cached)
-                    return (
-                        json.loads(data["open_positions"]),
-                        int(data["daily_trades"]),
-                        float(data["daily_pnl"]),
-                        data.get("day"),
-                    )
+                    updated_at = data.get("updated_at")
+                    candidates["redis"] = {
+                        "open_positions": json.loads(data["open_positions"]),
+                        "daily_trades": int(data["daily_trades"]),
+                        "daily_pnl": float(data["daily_pnl"]),
+                        "trade_date": data.get("trade_date") or (str(updated_at)[:10] if updated_at else None),
+                        "updated_at": updated_at,
+                    }
             except Exception as e:
-                print(f"[StateStorage] Redis cache read error: {e}")
+                self._redis_failed("cache read", e)
 
-        # 2. Fallback to SQLite
-        with self.get_db_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                "SELECT open_positions, daily_trades, daily_pnl, day FROM symbol_state WHERE symbol = ?",
-                (symbol,),
-            )
-            row = cursor.fetchone()
-            if row:
-                return (
-                    json.loads(row["open_positions"]),
-                    row["daily_trades"],
-                    row["daily_pnl"],
-                    row["day"],
+        if not candidates:
+            return [], 0, 0.0, None, "none"
+
+        # Ties go to SQLite, the source of truth
+        source = max(candidates, key=lambda k: (self._parse_ts(candidates[k]["updated_at"]), k == "sqlite"))
+        chosen = candidates[source]
+
+        if len(candidates) == 2:
+            def summary(c):
+                return (c["trade_date"], c["daily_trades"], round(c["daily_pnl"], 6), len(c["open_positions"]))
+            if summary(candidates["sqlite"]) != summary(candidates["redis"]):
+                print(
+                    f"[StateStorage] ⚠️ {symbol}: Redis state {summary(candidates['redis'])} @ {candidates['redis']['updated_at']} "
+                    f"differs from SQLite {summary(candidates['sqlite'])} @ {candidates['sqlite']['updated_at']} — using {source}"
                 )
 
-        return [], 0, 0.0, None
+        return chosen["open_positions"], chosen["daily_trades"], chosen["daily_pnl"], chosen["trade_date"], source
 
     # ── Trade History (trade_history) ───────────────────────────
 
@@ -270,15 +362,17 @@ class StateStorage:
 
     def set_shared_value(self, key: str, value: Any, expire_seconds: Optional[int] = None):
         """Sets a key in Redis or local in-memory fallback."""
+        self._ensure_redis()
         if self.redis_client:
             try:
                 val_str = json.dumps(value) if not isinstance(value, str) else value
                 self.redis_client.set(key, val_str, ex=expire_seconds)
             except Exception as e:
-                print(f"[StateStorage] set_shared_value error for {key}: {e}")
+                self._redis_failed(f"set_shared_value({key})", e)
 
     def get_shared_value(self, key: str) -> Optional[Any]:
         """Gets a key from Redis."""
+        self._ensure_redis()
         if self.redis_client:
             try:
                 val = self.redis_client.get(key)
@@ -288,7 +382,7 @@ class StateStorage:
                     except Exception:
                         return val
             except Exception as e:
-                print(f"[StateStorage] get_shared_value error for {key}: {e}")
+                self._redis_failed(f"get_shared_value({key})", e)
         return None
 
 
@@ -306,11 +400,14 @@ def get_storage() -> StateStorage:
 def init_db():
     get_storage().init_db()
 
-def save_bot_state(symbol: str, open_positions: list, daily_trades: int, daily_pnl: float, day: int):
-    get_storage().save_bot_state(symbol, open_positions, daily_trades, daily_pnl, day)
+def save_bot_state(symbol: str, open_positions: list, daily_trades: int, daily_pnl: float, trade_date: str):
+    get_storage().save_bot_state(symbol, open_positions, daily_trades, daily_pnl, trade_date)
 
 def load_bot_state(symbol: str):
     return get_storage().load_bot_state(symbol)
+
+def redis_connected() -> bool:
+    return get_storage().redis_connected()
 
 def record_closed_trade(symbol: str, action: str, entry: float, exit_price: float, pnl_pct: float, reason: str):
     get_storage().record_closed_trade(symbol, action, entry, exit_price, pnl_pct, reason)

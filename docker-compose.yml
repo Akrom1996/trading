@@ -9,6 +9,11 @@ services:
       - "6379:6379"
     mem_limit: 128m
     command: redis-server --save "" --appendonly no
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
 
   btc-analyzer:
     build: .
@@ -24,7 +29,8 @@ services:
     volumes:
       - ./data:/app/data
     depends_on:
-      - redis
+      redis:
+        condition: service_healthy
     restart: unless-stopped
     mem_limit: 400m
     memswap_limit: 800m
@@ -42,7 +48,8 @@ services:
     volumes:
       - ./data:/app/data
     depends_on:
-      - redis
+      redis:
+        condition: service_healthy
     restart: unless-stopped
     mem_limit: 600m
     memswap_limit: 1200m
@@ -60,7 +67,8 @@ services:
     volumes:
       - ./data:/app/data
     depends_on:
-      - redis
+      redis:
+        condition: service_healthy
     restart: unless-stopped
     mem_limit: 600m
     memswap_limit: 1200m
@@ -78,7 +86,8 @@ services:
     volumes:
       - ./data:/app/data
     depends_on:
-      - redis
+      redis:
+        condition: service_healthy
     restart: unless-stopped
     mem_limit: 600m
     memswap_limit: 1200m
@@ -96,7 +105,8 @@ services:
     volumes:
       - ./data:/app/data
     depends_on:
-      - redis
+      redis:
+        condition: service_healthy
     restart: unless-stopped
     mem_limit: 600m
     memswap_limit: 1200m
@@ -114,7 +124,8 @@ services:
     volumes:
       - ./data:/app/data
     depends_on:
-      - redis
+      redis:
+        condition: service_healthy
     restart: unless-stopped
     mem_limit: 600m
     memswap_limit: 1200m
@@ -132,7 +143,8 @@ services:
     volumes:
       - ./data:/app/data
     depends_on:
-      - redis
+      redis:
+        condition: service_healthy
     restart: unless-stopped
     mem_limit: 600m
     memswap_limit: 1200m
@@ -149,6 +161,7 @@ services:
     volumes:
       - ./data:/app/data
     depends_on:
-      - redis
+      redis:
+        condition: service_healthy
     restart: always
     mem_limit: 256m
