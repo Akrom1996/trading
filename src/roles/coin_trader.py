@@ -6,7 +6,7 @@ pending limit-buy monitoring, OCO safety, pyramiding, and trade journaling.
 
 import math
 import time
-from datetime import datetime
+from datetime import date, datetime
 from typing import Dict, Any, List, Optional, Tuple
 
 import pandas as pd
@@ -34,6 +34,7 @@ from src.services.redis_cache import (
     get_last_sl_time,
     get_last_tp_time,
     get_shared_value,
+    redis_connected,
 )
 from src.services.telegram_notifier import (
     notify_signal,
@@ -63,6 +64,10 @@ from src.indicators.technicals import (
 )
 
 VALID_STATUSES = ('open', 'pending_fill')
+
+LIVE_OFF_LOG_EVERY_SEC = 3600
+BTC_UNKNOWN_LOG_EVERY_SEC = 3600
+PYRAMID_SKIP_LOG_EVERY_SEC = 1800
 
 
 def get_decimal_places(price: float) -> int:
@@ -380,15 +385,75 @@ def retrain_barrier_and_save(symbol: str, df_features: Optional[pd.DataFrame] = 
             f"⚠️ <b>[{symbol}] Barrier model imbalance warning</b>\n"
             f"Profitable Fibonacci examples are only {fib_tp_pct:.1f}% of training data — live probabilities may stay low."
         )
+    return barrier_model, barrier_scaler, barrier_encoder, label_stats.get('oos')
 
-    oos = label_stats.get('oos') or {}
-    if oos.get('entered') and oos.get('avg_return') is not None and oos['avg_return'] <= 0:
-        send_message(
-            f"⚠️ <b>[{symbol}] Barrier model has no out-of-sample edge</b>\n"
-            f"Holdout: {oos['entered']}/{oos['test_rows']} rows entered, "
-            f"win rate <b>{oos['win_rate']:.0%}</b>, avg return <b>{oos['avg_return']*100:+.2f}%</b> net of fees."
-        )
-    return barrier_model, barrier_scaler, barrier_encoder
+
+def live_entries_allowed(oos: Optional[Dict[str, Any]]) -> Tuple[bool, str]:
+    """Real entries only once the barrier model's out-of-sample edge is proven."""
+    if not settings.REQUIRE_POSITIVE_OOS:
+        return True, "OOS check disabled"
+    oos = oos or {}
+    entered = int(oos.get('entered') or 0)
+    avg = oos.get('avg_return')
+    avg_str = f"{avg*100:+.2f}%" if avg is not None else "n/a"
+    if entered >= settings.MIN_OOS_TRADES and avg is not None and avg > settings.MIN_OOS_AVG_RETURN:
+        return True, f"OOS edge proven (entered={entered}, avg={avg_str})"
+    return False, f"OOS edge not proven (entered={entered}, avg={avg_str})"
+
+
+def read_btc_bias(now: datetime) -> str:
+    """BTC macro bias from the analyzer; missing or stale (> BTC_REGIME_MAX_AGE_MIN) is UNKNOWN."""
+    regime = get_shared_value("btc:macro_regime")
+    if not isinstance(regime, dict):
+        return 'UNKNOWN'
+    try:
+        updated_at = datetime.fromisoformat(str(regime.get('updated_at')))
+    except (TypeError, ValueError):
+        return 'UNKNOWN'
+    if (now - updated_at).total_seconds() > settings.BTC_REGIME_MAX_AGE_MIN * 60:
+        return 'UNKNOWN'
+    return str(regime.get('bias') or 'NEUTRAL').strip().upper()
+
+
+def restore_daily_state(symbol: str, today: str) -> Tuple[List[dict], int, float, Optional[str], str]:
+    """Loads saved state; daily counters only carry over if they were saved on the same calendar date."""
+    positions, trades, pnl, saved_date, source = load_bot_state(symbol)
+    if saved_date != today:
+        trades, pnl = 0, 0.0
+    return positions or [], trades, pnl, saved_date, source
+
+
+class ChangeThrottle:
+    """should_emit() is True when the value changes, or when every_sec has passed since it last was."""
+
+    def __init__(self, every_sec: float):
+        self.every_sec = every_sec
+        self.last_value: Any = None
+        self.last_time: Optional[datetime] = None
+
+    def should_emit(self, value: Any, now: datetime) -> bool:
+        if (value != self.last_value or self.last_time is None
+                or (now - self.last_time).total_seconds() >= self.every_sec):
+            self.last_value = value
+            self.last_time = now
+            return True
+        return False
+
+
+def announce_live_state(symbol: str, enabled: bool, reason: str, previous: Optional[bool]):
+    """Logs the live-entry state and tells the admin chat when it flips (or starts OFF)."""
+    state = "ON" if enabled else "OFF"
+    print(f"[{symbol}] Live entries {state}: {reason}")
+    if previous is None and enabled:
+        return
+    if previous is not None and previous == enabled:
+        return
+    icon = "🟢" if enabled else "⛔"
+    note = "Real orders will be placed again." if enabled else "Signals are still computed; no new real orders. Open positions stay managed."
+    send_message(
+        f"{icon} <b>[{symbol}] Live entries {state}</b>\n{reason}\n<i>{note}</i>",
+        chat_id=settings.TELEGRAM_ERROR_CHAT_ID,
+    )
 
 
 def run_coin_trader(symbol: Optional[str] = None):
@@ -416,39 +481,46 @@ def run_coin_trader(symbol: Optional[str] = None):
     barrier_model, barrier_scaler, barrier_encoder, barrier_meta = load_barrier_model(symbol=symbol)
     if barrier_model is None:
         print(f"[{symbol}] Training fresh barrier model...")
-        barrier_model, barrier_scaler, barrier_encoder = retrain_barrier_and_save(symbol)
+        barrier_model, barrier_scaler, barrier_encoder, barrier_oos = retrain_barrier_and_save(symbol)
     else:
         print(f"  Saved barrier model found (trained {barrier_meta['trained_at']})")
+        barrier_oos = barrier_meta.get('oos')
 
-    # 3. Restore state from DB/Redis
-    saved_positions, saved_trades, saved_pnl, saved_day = load_bot_state(symbol)
+    live_entries_enabled, live_reason = live_entries_allowed(barrier_oos)
+    announce_live_state(symbol, live_entries_enabled, live_reason, previous=None)
+
+    # 3. Restore state (SQLite is the source of truth; a newer Redis copy wins)
     now0 = datetime.now()
-    if saved_positions or saved_day == now0.day:
-        open_positions = saved_positions or []
-        daily_trades = saved_trades if saved_day == now0.day else 0
-        daily_pnl = saved_pnl if saved_day == now0.day else 0.0
-        if open_positions:
-            try:
-                _price_for_decimals = fetch_current_price(symbol)
-                _decimals = get_decimal_places(_price_for_decimals)
-            except Exception:
-                _decimals = 4
-            open_positions = [normalize_position(p, _decimals, symbol) for p in open_positions]
+    trade_date = date.today().isoformat()
+    open_positions, daily_trades, daily_pnl, saved_date, state_source = restore_daily_state(symbol, trade_date)
+    if open_positions:
+        try:
+            _price_for_decimals = fetch_current_price(symbol)
+            _decimals = get_decimal_places(_price_for_decimals)
+        except Exception:
+            _decimals = 4
+        open_positions = [normalize_position(p, _decimals, symbol) for p in open_positions]
         print(f"[{symbol}] Restored {len(open_positions)} open position(s) from DB")
-        if open_positions:
-            send_message(f"🔄 <b>[{symbol}] Restarted — restored {len(open_positions)} open position(s) from DB</b>")
-            save_bot_state(symbol, open_positions, daily_trades, daily_pnl, now0.day)
-    else:
-        open_positions = []
-        daily_trades = 0
-        daily_pnl = 0.0
+        send_message(f"🔄 <b>[{symbol}] Restarted — restored {len(open_positions)} open position(s) from DB</b>")
+    print(
+        f"[{symbol}] Restored daily state: date {trade_date}, "
+        f"trades {daily_trades}/{settings.MAX_TRADES_PER_DAY}, pnl {daily_pnl:.2f}%, "
+        f"loss limit hit: {'yes' if daily_pnl <= -settings.MAX_DAILY_LOSS else 'no'}, "
+        f"source: {state_source}{'' if saved_date in (None, trade_date) else f' (saved {saved_date}, counters reset)'}, "
+        f"redis: {'connected' if redis_connected() else 'unavailable'}"
+    )
+    if open_positions or saved_date == trade_date:
+        save_bot_state(symbol, open_positions, daily_trades, daily_pnl, trade_date)
 
     last_retrain = datetime.now()
-    last_day = datetime.now().day
     limit_notice_sent = False
     loss_limit_notice_sent = False
     last_chop_alert_time: Optional[datetime] = None
     last_chop_signal_time: Optional[datetime] = None
+    last_candle_check_ts: Optional[pd.Timestamp] = None
+    live_log = ChangeThrottle(LIVE_OFF_LOG_EVERY_SEC)
+    btc_log = ChangeThrottle(BTC_UNKNOWN_LOG_EVERY_SEC)
+    pyramid_log = ChangeThrottle(PYRAMID_SKIP_LOG_EVERY_SEC)
 
     last_sl_time = get_last_sl_time(symbol)
     if last_sl_time is not None:
@@ -474,17 +546,18 @@ def run_coin_trader(symbol: Optional[str] = None):
     while True:
         now = datetime.now()
 
-        # Midnight reset
-        if now.day != last_day:
+        # Midnight reset (full calendar date, so the same day-of-month next month doesn't match)
+        today = date.today().isoformat()
+        if today != trade_date:
             daily_trades = 0
             daily_pnl = 0.0
-            last_day = now.day
+            trade_date = today
             limit_notice_sent = False
             loss_limit_notice_sent = False
             print(f"[{symbol}] [{now.strftime('%H:%M')}] Daily counters reset (holding {len(open_positions)} positions)")
             holding_msg = f"\nHolding <b>{len(open_positions)}</b> open position(s) into the new day." if open_positions else ""
             send_message(f"🔄 <b>[{symbol}] Daily counters reset</b>{holding_msg}")
-            save_bot_state(symbol, open_positions, daily_trades, daily_pnl, last_day)
+            save_bot_state(symbol, open_positions, daily_trades, daily_pnl, trade_date)
 
         # Periodic Retrain
         if (now - last_retrain).total_seconds() / 60 >= 60:
@@ -504,16 +577,28 @@ def run_coin_trader(symbol: Optional[str] = None):
                     notify_error(f"[{symbol}] Retrain failed: {e}")
 
                 try:
-                    barrier_model, barrier_scaler, barrier_encoder = retrain_barrier_and_save(symbol, df_train)
+                    barrier_model, barrier_scaler, barrier_encoder, barrier_oos = retrain_barrier_and_save(symbol, df_train)
+                    was_enabled = live_entries_enabled
+                    live_entries_enabled, live_reason = live_entries_allowed(barrier_oos)
+                    announce_live_state(symbol, live_entries_enabled, live_reason, previous=was_enabled)
                 except Exception as e:
                     notify_error(f"[{symbol}] Barrier retrain failed: {e}")
 
         # Without fresh market data every step below would act on a stale (or undefined) price
         try:
-            df_recent = fetch_ohlcv(symbol, '5m', limit=2)
+            df_recent = fetch_ohlcv(symbol, '5m', limit=3)
             latest_candle = df_recent.iloc[-1]
-            candle_high = float(latest_candle['high'])
-            candle_low = float(latest_candle['low'])
+            # Every candle since the one that was current at the last check, so a touch that
+            # happened in a candle that closed between loops isn't missed (virtual / dry-run only)
+            if last_candle_check_ts is not None:
+                window = df_recent[df_recent['timestamp'] >= last_candle_check_ts]
+            else:
+                window = df_recent.iloc[[-1]]
+            if window.empty:
+                window = df_recent.iloc[[-1]]
+            candle_high = float(window['high'].max())
+            candle_low = float(window['low'].min())
+            last_candle_check_ts = latest_candle['timestamp']
             current_price = float(latest_candle['close'])
             decimals = get_decimal_places(current_price)
         except Exception as e:
@@ -612,7 +697,7 @@ def run_coin_trader(symbol: Optional[str] = None):
             for pos in closed_positions:
                 open_positions.remove(pos)
             if closed_positions or state_changed:
-                save_bot_state(symbol, open_positions, daily_trades, daily_pnl, last_day)
+                save_bot_state(symbol, open_positions, daily_trades, daily_pnl, trade_date)
 
             # ── Step 2.5: Profit Lock / Breakeven check (+1% gain protection) ──
             for pos in open_positions:
@@ -661,7 +746,7 @@ def run_coin_trader(symbol: Optional[str] = None):
                     f"🛑 Stop Loss Moved: <b>{safe_sl} (+{pnl_locked:.1f}%)</b>\n"
                     f"🎯 Take Profit: <b>{pos['take_profit']}</b> (unchanged)\n\n{footer}"
                 )
-                save_bot_state(symbol, open_positions, daily_trades, daily_pnl, last_day)
+                save_bot_state(symbol, open_positions, daily_trades, daily_pnl, trade_date)
 
         except Exception as e:
             print(f"[{symbol}] [{now.strftime('%H:%M')}] Position loop check error: {e}")
@@ -730,8 +815,18 @@ def run_coin_trader(symbol: Optional[str] = None):
             # -------------------------------------------------------------
             # STEP 1: CHECK BTC MACRO REGIME FIRST (Circuit Breaker)
             # -------------------------------------------------------------
-            btc_macro = get_shared_value("btc:macro_regime")
-            btc_bias = (btc_macro.get('bias', 'NEUTRAL') if btc_macro else 'NEUTRAL').strip().upper()
+            btc_bias = read_btc_bias(now)
+            btc_blocks_entries = btc_bias == 'UNKNOWN' and settings.BTC_REGIME_REQUIRED
+            if btc_blocks_entries:
+                if btc_log.should_emit(True, now):
+                    print(f"[{symbol}] [{now.strftime('%H:%M')}] BTC regime unavailable — no new entries")
+                if signal.get('action') == 'BUY':
+                    signal['action'] = None
+            else:
+                btc_log.should_emit(False, now)
+
+            if not live_entries_enabled and live_log.should_emit(live_reason, now):
+                print(f"[{symbol}] [{now.strftime('%H:%M')}] Live entries disabled: {live_reason}")
 
             # If BTC is BEARISH and signal is BUY, demote immediately and skip!
             if btc_bias == 'BEARISH' and signal.get('action') == 'BUY':
@@ -821,10 +916,14 @@ def run_coin_trader(symbol: Optional[str] = None):
                 f"Price: {current_price} | "
                 f"{btc_info} | "
                 f"{liq_info} | "
-                f"Trades: {daily_trades}/{settings.MAX_TRADES_PER_DAY}"
+                f"Trades: {daily_trades}/{settings.MAX_TRADES_PER_DAY} | "
+                f"Live: {'ON' if live_entries_enabled else 'OFF'}"
             )
 
-            if signal.get('action') == 'BUY':
+            if signal.get('action') == 'BUY' and not live_entries_enabled:
+                pass  # signal is logged above with "Live: OFF"; no real order
+
+            elif signal.get('action') == 'BUY':
                 last_chop_alert_time = None
                 level_text = ""
                 if levels:
@@ -838,16 +937,20 @@ def run_coin_trader(symbol: Optional[str] = None):
                 order_label = f"fresh {order_type} entry"
                 new_pos = open_position(
                     entry_price, effective_tp, effective_sl, now,
-                    order_label, symbol, order_type=order_type
+                    order_label, symbol, order_type=order_type, allow_virtual=False,
                 )
 
-                open_positions.append(new_pos)
-                daily_trades += 1
-                save_bot_state(symbol, open_positions, daily_trades, daily_pnl, last_day)
+                if new_pos is None:
+                    print(f"[{symbol}] [{now.strftime('%H:%M')}] Fresh entry not opened (order failed) — no position tracked")
+                else:
+                    open_positions.append(new_pos)
+                    daily_trades += 1
+                    save_bot_state(symbol, open_positions, daily_trades, daily_pnl, trade_date)
 
             elif signal.get('action') == 'CHOP':
                 # ── Notification Alert Only (DO NOT execute on Binance) ──
-                cooldown_min = settings.CHOP_ALERT_COOLDOWN_MINUTES or settings.SELL_ALERT_COOLDOWN_MINUTES
+                cooldown_min = (getattr(settings, 'CHOP_ALERT_COOLDOWN_MINUTES', None)
+                                or getattr(settings, 'SELL_ALERT_COOLDOWN_MINUTES', 30))
                 cooldown_sec = cooldown_min * 60
                 can_alert = (
                     last_chop_alert_time is None
@@ -877,7 +980,8 @@ def run_coin_trader(symbol: Optional[str] = None):
                     print(f"[{symbol}] [{now.strftime('%H:%M')}] CHOP signal active (throttled, {mins_left}m alert cooldown remaining)")
 
             # Pyramiding: only reached after the trade-cap, loss-limit and cooldown gates above
-            if open_positions and signal.get('action') != 'BUY':
+            if (open_positions and signal.get('action') != 'BUY'
+                    and live_entries_enabled and not btc_blocks_entries):
                 try:
                     rung, pyr_reason = try_pyramid(
                         symbol, open_positions, df, current_price, decimals, now, raw_action,
@@ -900,8 +1004,8 @@ def run_coin_trader(symbol: Optional[str] = None):
                         f"🛑 SL:    <b>{rung['stop_loss']} (-{rung['sl_pct']*100:.1f}%)</b>\n"
                         f"📊 {pyr_reason}"
                     )
-                    save_bot_state(symbol, open_positions, daily_trades, daily_pnl, last_day)
-                else:
+                    save_bot_state(symbol, open_positions, daily_trades, daily_pnl, trade_date)
+                elif pyramid_log.should_emit(pyr_reason, now):
                     print(f"[{symbol}] [{now.strftime('%H:%M')}] Pyramid skipped: {pyr_reason}")
         except Exception as e:
             notify_error(f"[{symbol}] {e}")

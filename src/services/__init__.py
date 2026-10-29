@@ -11,6 +11,7 @@ from src.services.redis_cache import (
     get_last_tp_time,
     set_shared_value,
     get_shared_value,
+    redis_connected,
 )
 from src.services.telegram_notifier import (
     TelegramNotifier,
@@ -41,6 +42,7 @@ __all__ = [
     "get_last_tp_time",
     "set_shared_value",
     "get_shared_value",
+    "redis_connected",
     "TelegramNotifier",
     "get_notifier",
     "send_message",
