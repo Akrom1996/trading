@@ -4,6 +4,7 @@ Manages symbol lifecycle, technical indicators, ML & Fibonacci barrier predictio
 pending limit-buy monitoring, OCO safety, pyramiding, and trade journaling.
 """
 
+import math
 import time
 from datetime import datetime
 from typing import Dict, Any, List, Optional, Tuple
@@ -22,8 +23,9 @@ from src.exchanges.binance_client import (
     place_oco_sell,
     check_order_status,
     cancel_order,
+    get_min_notional,
 )
-from src.indicators.heatmap import get_liq_data
+from src.indicators.heatmap import get_liq_data, liq_feed_connected
 from src.services.redis_cache import (
     init_db,
     save_bot_state,
@@ -102,6 +104,10 @@ def normalize_position(pos: dict, decimals: int, symbol: str) -> dict:
         pos['virtual'] = False
     if 'profit_locked' not in pos:
         pos['profit_locked'] = float(pos.get('stop_loss', 0)) > float(pos.get('entry', 0))
+    if 'is_pyramid_child' not in pos:
+        pos['is_pyramid_child'] = False
+    if 'size_mult' not in pos:
+        pos['size_mult'] = 1.0
     pos.pop('peak_price', None)
     pos.pop('trailing_stop', None)
     return pos
@@ -130,11 +136,15 @@ def close_position(pos: dict, current_price: float, reason: str, daily_pnl: floa
             notify_error(f"[{symbol}] SELL order failed on close: {e}")
             print(f"[{symbol}] Order error on close: {e}")
 
+    # The "Virtual: " prefix keeps these out of the prefix-matched cooldown restore on restart
     record_closed_trade(
         symbol=symbol, action=pos["action"], entry=pos["entry"],
-        exit_price=current_price, pnl_pct=pnl, reason=reason,
+        exit_price=current_price, pnl_pct=pnl,
+        reason=f"Virtual: {reason}" if pos.get('virtual') else reason,
     )
-    return daily_pnl + pnl
+    if pos.get('virtual'):
+        return daily_pnl
+    return daily_pnl + pnl * pos.get('size_mult', 1.0)
 
 
 def process_pending_fill(pos: dict, now: datetime, symbol: str) -> str:
@@ -195,9 +205,12 @@ def protect_position(pos: dict, symbol: str) -> bool:
 
 def open_position(price: float, tp_pct: float, sl_pct: float, now: datetime,
                   label: str, symbol: str, is_pyramid: bool = False,
-                  order_type: Optional[str] = None) -> dict:
+                  order_type: Optional[str] = None,
+                  quote_amount: Optional[float] = None,
+                  allow_virtual: bool = True) -> Optional[dict]:
     if order_type is None:
         order_type = 'limit' if is_pyramid else 'market'
+    amount = quote_amount or settings.QUOTE_AMOUNT_PER_TRADE
     d = get_decimal_places(price)
     pos = {
         'action': 'BUY',
@@ -216,14 +229,16 @@ def open_position(price: float, tp_pct: float, sl_pct: float, now: datetime,
         'virtual': False,
         'opened_at': now.strftime('%H:%M'),
         'profit_locked': False,
+        'is_pyramid_child': False,
+        'size_mult': 1.0,
     }
     try:
         if order_type == 'limit':
-            res = place_limit_buy(symbol, price, settings.QUOTE_AMOUNT_PER_TRADE)
+            res = place_limit_buy(symbol, price, amount)
             pos['buy_order_id'] = res.get('id')
             pos['base_amount'] = res.get('filled_amount') or 0.0
         else:
-            res = place_market_buy(symbol, settings.QUOTE_AMOUNT_PER_TRADE)
+            res = place_market_buy(symbol, amount)
             pos['buy_order_id'] = res.get('id')
             if res.get('status') == 'closed' and res.get('filled_amount'):
                 apply_fill(pos, res['filled_amount'], res['avg_price'])
@@ -231,9 +246,111 @@ def open_position(price: float, tp_pct: float, sl_pct: float, now: datetime,
             # otherwise stays pending_fill and Step 1 handles it
         return pos
     except Exception as e:
+        if not allow_virtual:
+            notify_error(f"⚠️ [{symbol}] {label} order failed ({e}) — skipped")
+            print(f"[{symbol}] [{now.strftime('%H:%M')}] {label} order failed ({e}) — not tracking")
+            return None
         pos.update(status='open', virtual=True, error=str(e))
         notify_error(f"⚠️ [{symbol}] {label} order failed ({e}) — tracking signal anyway")
         return pos
+
+
+def open_risk_pct(positions: List[dict]) -> float:
+    """Size-weighted distance to stop over real positions; profit-locked stops contribute 0."""
+    risk = 0.0
+    for p in positions:
+        if p.get('virtual') or p.get('status') not in VALID_STATUSES:
+            continue
+        entry = float(p['entry'])
+        if entry <= 0:
+            continue
+        risk += max(0.0, (entry - float(p['stop_loss'])) / entry) * p.get('size_mult', 1.0)
+    return risk
+
+
+def find_pyramid_parent(positions: List[dict]) -> Optional[dict]:
+    """First real, filled, profit-locked BUY that has not been pyramided and is not itself a pyramid."""
+    for p in positions:
+        if (p.get('status') == 'open'
+                and p.get('action') == 'BUY'
+                and not p.get('virtual')
+                and not p.get('pyramided')
+                and not p.get('is_pyramid_child')
+                and p.get('profit_locked') is True):
+            return p
+    return None
+
+
+def try_pyramid(symbol: str, open_positions: List[dict], df: pd.DataFrame, current_price: float,
+                decimals: int, now: datetime, raw_action: Optional[str], btc_bias: str,
+                liq: Optional[Dict[str, Any]], last_chop_signal_time: Optional[datetime],
+                barrier_model: Any, barrier_scaler: Any, barrier_encoder: Any) -> Tuple[Optional[dict], str]:
+    """Places a half-size pyramid rung only if every gate passes; returns (position, reason)."""
+    if len(open_positions) >= settings.MAX_PYRAMID_POSITIONS:
+        return None, f"max positions ({settings.MAX_PYRAMID_POSITIONS})"
+
+    parent = find_pyramid_parent(open_positions)
+    if parent is None:
+        return None, "no profit-locked parent"
+
+    trigger = parent['take_profit'] * (1 - settings.PYRAMID_TRIGGER_PCT)
+    if current_price < trigger:
+        return None, f"price {current_price} below trigger {trigger:.{decimals}f}"
+
+    if raw_action == 'CHOP':
+        return None, "directional model says CHOP"
+    if raw_action != 'BUY':
+        return None, f"directional model not bullish ({raw_action or 'NONE'})"
+
+    if (last_chop_signal_time is not None
+            and (now - last_chop_signal_time).total_seconds() < settings.PYRAMID_CHOP_BLOCK_MINUTES * 60):
+        return None, f"CHOP signal within last {settings.PYRAMID_CHOP_BLOCK_MINUTES}m"
+
+    if btc_bias == 'BEARISH':
+        return None, "BTC macro BEARISH"
+
+    coin = symbol.split('/')[0]
+    if settings.PYRAMID_REQUIRE_LIQ_FEED and not liq_feed_connected(coin):
+        return None, "liquidation feed disconnected"
+
+    if liq and (liq.get('bias') == 'BEARISH' or liq.get('liq_spike')):
+        return None, f"liquidations unfavourable ({liq.get('bias')}, spike={liq.get('liq_spike')})"
+
+    if barrier_model is None:
+        return None, "no barrier model"
+
+    barrier_probs = predict_barrier_probabilities(barrier_model, barrier_scaler, barrier_encoder, df)
+    enter, ev_reason = should_enter(barrier_probs)
+    if not enter:
+        return None, ev_reason
+
+    tp_pct = barrier_probs['recommended_tp']
+    sl_pct = barrier_probs['recommended_sl']
+    size_mult = settings.PYRAMID_SIZE_MULT
+    current_risk = open_risk_pct(open_positions)
+    if current_risk + sl_pct * size_mult > settings.MAX_OPEN_RISK_PCT:
+        return None, (f"open risk {current_risk*100:.2f}% + {sl_pct*size_mult*100:.2f}% "
+                      f"> cap {settings.MAX_OPEN_RISK_PCT*100:.2f}%")
+
+    quote_amount = settings.QUOTE_AMOUNT_PER_TRADE * size_mult
+    try:
+        min_notional = get_min_notional(symbol)
+    except Exception:
+        min_notional = None
+    if min_notional is not None and quote_amount < min_notional:
+        return None, f"rung size {quote_amount:.2f} below exchange minimum {min_notional:.2f}"
+
+    entry = round(current_price * (1 - settings.ENTRY_OFFSET_PCT * 1.7), decimals)
+    child = open_position(entry, tp_pct, sl_pct, now, 'pyramid entry', symbol,
+                          is_pyramid=True, quote_amount=quote_amount, allow_virtual=False)
+    if child is None:
+        return None, "order failed"
+
+    child['is_pyramid_child'] = True
+    child['pyramided'] = True
+    child['size_mult'] = size_mult
+    parent['pyramided'] = True
+    return child, ev_reason
 
 
 def fetch_training_features(symbol: str) -> pd.DataFrame:
@@ -247,9 +364,9 @@ def retrain_and_save(symbol: str, df_features: Optional[pd.DataFrame] = None):
     df = add_labels(df_features)
     print(f"  Candles loaded : {len(df)}")
     print("Training model...")
-    model, scaler, encoder = train_model(df)
-    save_model(model, scaler, encoder, symbol=symbol, candles_count=len(df))
-    return model, scaler, encoder
+    model, scaler, encoder, train_meta = train_model(df)
+    metadata = save_model(model, scaler, encoder, symbol=symbol, candles_count=len(df), extra_meta=train_meta)
+    return model, scaler, encoder, metadata
 
 
 def retrain_barrier_and_save(symbol: str, df_features: Optional[pd.DataFrame] = None):
@@ -262,6 +379,14 @@ def retrain_barrier_and_save(symbol: str, df_features: Optional[pd.DataFrame] = 
         send_message(
             f"⚠️ <b>[{symbol}] Barrier model imbalance warning</b>\n"
             f"Profitable Fibonacci examples are only {fib_tp_pct:.1f}% of training data — live probabilities may stay low."
+        )
+
+    oos = label_stats.get('oos') or {}
+    if oos.get('entered') and oos.get('avg_return') is not None and oos['avg_return'] <= 0:
+        send_message(
+            f"⚠️ <b>[{symbol}] Barrier model has no out-of-sample edge</b>\n"
+            f"Holdout: {oos['entered']}/{oos['test_rows']} rows entered, "
+            f"win rate <b>{oos['win_rate']:.0%}</b>, avg return <b>{oos['avg_return']*100:+.2f}%</b> net of fees."
         )
     return barrier_model, barrier_scaler, barrier_encoder
 
@@ -284,7 +409,7 @@ def run_coin_trader(symbol: Optional[str] = None):
         print(f"  Saved model found! Trained at {trained_at} ({age_hours:.1f}h old)")
     else:
         print(f"[{symbol}] Training fresh directional model...")
-        model, scaler, encoder = retrain_and_save(symbol)
+        model, scaler, encoder, metadata = retrain_and_save(symbol)
 
     # 2. Load or train barrier model
     print(f"[{symbol}] Checking for saved barrier model...")
@@ -322,13 +447,14 @@ def run_coin_trader(symbol: Optional[str] = None):
     last_day = datetime.now().day
     limit_notice_sent = False
     loss_limit_notice_sent = False
-    last_sell_alert_time: Optional[datetime] = None
+    last_chop_alert_time: Optional[datetime] = None
+    last_chop_signal_time: Optional[datetime] = None
 
     last_sl_time = get_last_sl_time(symbol)
     if last_sl_time is not None:
         secs_since_sl = (now0 - last_sl_time).total_seconds()
         if secs_since_sl < settings.SL_COOLDOWN_MINUTES * 60:
-            mins_left = int((settings.SL_COOLDOWN_MINUTES * 60 - secs_since_sl) // 60) + 1
+            mins_left = math.ceil((settings.SL_COOLDOWN_MINUTES * 60 - secs_since_sl) / 60)
             print(f"[{symbol}] Active Stop Loss cooldown restored: {mins_left}m remaining")
         else:
             last_sl_time = None
@@ -337,7 +463,7 @@ def run_coin_trader(symbol: Optional[str] = None):
     if last_tp_time is not None:
         secs_since_tp = (now0 - last_tp_time).total_seconds()
         if secs_since_tp < settings.TP_COOLDOWN_MINUTES * 60:
-            mins_left = int((settings.TP_COOLDOWN_MINUTES * 60 - secs_since_tp) // 60) + 1
+            mins_left = math.ceil((settings.TP_COOLDOWN_MINUTES * 60 - secs_since_tp) / 60)
             print(f"[{symbol}] Active TP cooldown restored: {mins_left}m remaining")
         else:
             last_tp_time = None
@@ -373,7 +499,7 @@ def run_coin_trader(symbol: Optional[str] = None):
 
             if df_train is not None:
                 try:
-                    model, scaler, encoder = retrain_and_save(symbol, df_train)
+                    model, scaler, encoder, metadata = retrain_and_save(symbol, df_train)
                 except Exception as e:
                     notify_error(f"[{symbol}] Retrain failed: {e}")
 
@@ -435,13 +561,17 @@ def run_coin_trader(symbol: Optional[str] = None):
                     state = r['state']
 
                     if state == 'tp':
-                        daily_pnl = close_position(pos, r['exit_price'] or pos['take_profit'],
-                                                "TP Hit (OCO filled)", daily_pnl, symbol)
+                        exit_price = r['exit_price'] or pos['take_profit']
+                        print(f"[{symbol}] [{now.strftime('%H:%M')}] ✅ TP Hit (OCO filled) | "
+                              f"entry {pos['entry']} → exit {exit_price}")
+                        daily_pnl = close_position(pos, exit_price, "TP Hit (OCO filled)", daily_pnl, symbol)
                         closed_positions.append(pos); last_tp_time = now
                     elif state == 'sl':
                         reason = "Profit Lock Hit (OCO filled)" if pos.get('profit_locked') else "SL Hit (OCO filled)"
-                        daily_pnl = close_position(pos, r['exit_price'] or pos['stop_loss'],
-                                                reason, daily_pnl, symbol)
+                        exit_price = r['exit_price'] or pos['stop_loss']
+                        print(f"[{symbol}] [{now.strftime('%H:%M')}] 🛑 {reason} | "
+                              f"entry {pos['entry']} → exit {exit_price}")
+                        daily_pnl = close_position(pos, exit_price, reason, daily_pnl, symbol)
                         closed_positions.append(pos)
                         if pos.get('profit_locked'):
                             last_tp_time = now
@@ -457,17 +587,22 @@ def run_coin_trader(symbol: Optional[str] = None):
                     if state != 'dry_run':
                         continue
 
+                # Virtual positions (order never placed) are reported but never start a cooldown
+                is_virtual = bool(pos.get('virtual'))
                 if candle_high >= pos['take_profit']:
                     daily_pnl = close_position(pos, pos['take_profit'], "TP Hit (Candle High)", daily_pnl, symbol)
                     closed_positions.append(pos)
-                    last_tp_time = now
-                    print(f"⏸️ [{symbol}] TP Cooldown Initiated ({settings.TP_COOLDOWN_MINUTES}m)")
+                    if not is_virtual:
+                        last_tp_time = now
+                        print(f"⏸️ [{symbol}] TP Cooldown Initiated ({settings.TP_COOLDOWN_MINUTES}m)")
 
                 elif candle_low <= pos['stop_loss']:
                     reason = "Profit Lock Hit (Candle Low)" if pos.get('profit_locked') else "SL Hit (Candle Low)"
                     daily_pnl = close_position(pos, pos['stop_loss'], reason, daily_pnl, symbol)
                     closed_positions.append(pos)
-                    if pos.get('profit_locked'):
+                    if is_virtual:
+                        print(f"[{symbol}] [{now.strftime('%H:%M')}] Virtual position closed ({reason}) — no cooldown, not counted in PnL")
+                    elif pos.get('profit_locked'):
                         last_tp_time = now
                         print(f"⏸️ [{symbol}] Profit Lock Hit (+{((pos['stop_loss']-pos['entry'])/pos['entry'])*100:.1f}%), TP Cooldown Initiated ({settings.TP_COOLDOWN_MINUTES}m)")
                     else:
@@ -527,49 +662,6 @@ def run_coin_trader(symbol: Optional[str] = None):
                     f"🎯 Take Profit: <b>{pos['take_profit']}</b> (unchanged)\n\n{footer}"
                 )
                 save_bot_state(symbol, open_positions, daily_trades, daily_pnl, last_day)
-            
-            # Step 3: Pyramiding
-            is_sl_cooldown = last_sl_time is not None and (now - last_sl_time).total_seconds() < settings.SL_COOLDOWN_MINUTES * 60
-            if (len(open_positions) < settings.MAX_PYRAMID_POSITIONS
-                    and daily_trades < settings.MAX_TRADES_PER_DAY
-                    and barrier_model is not None
-                    and not is_sl_cooldown):
-                for pos in open_positions:
-                    if pos.get('status') != 'open' or pos['action'] != 'BUY' or pos.get('pyramided'):
-                        continue
-                    near_tp = current_price >= pos['take_profit'] * (1 - settings.PYRAMID_TRIGGER_PCT)
-                    if not near_tp:
-                        continue
-
-                    try:
-                        df_pyr = fetch_ohlcv(symbol, '5m', limit=settings.LIVE_CANDLES)
-                        df_pyr = add_features(df_pyr)
-                        pyr_barrier_probs = predict_barrier_probabilities(barrier_model, barrier_scaler, barrier_encoder, df_pyr)
-                        still_bullish, reason = should_enter(pyr_barrier_probs)
-                    except Exception as e:
-                        still_bullish = False
-                        reason = f"barrier check failed: {e}"
-
-                    pos['pyramided'] = True
-
-                    if still_bullish:
-                        new_entry = round(current_price * (1 - settings.ENTRY_OFFSET_PCT * 1.7), decimals)
-                        rung_tp_pct = pyr_barrier_probs.get('recommended_tp', TP_PCT)
-                        rung_sl_pct = calculate_dynamic_sl(rung_tp_pct)
-                        new_pos = open_position(new_entry, rung_tp_pct, rung_sl_pct, now, 'pyramid entry', symbol, is_pyramid=True)
-                        open_positions.append(new_pos)
-
-                        daily_trades += 1
-                        virtual_tag = " 🔸(signal only)" if new_pos.get('virtual') else " (pending fill)"
-                        send_message(
-                            f"🔼 <b>[{symbol}] Pyramid entry #{len(open_positions)}{virtual_tag}</b>\n\n"
-                            f"💰 Entry: <b>{new_entry}</b>\n"
-                            f"🎯 TP:    <b>{new_pos['take_profit']} (+{rung_tp_pct*100:.1f}% Fib)</b>\n"
-                            f"🛑 SL:    <b>{new_pos['stop_loss']} (-{rung_sl_pct*100:.1f}%)</b>\n"
-                            f"📊 {reason}"
-                        )
-                    save_bot_state(symbol, open_positions, daily_trades, daily_pnl, last_day)
-                    break
 
         except Exception as e:
             print(f"[{symbol}] [{now.strftime('%H:%M')}] Position loop check error: {e}")
@@ -607,7 +699,7 @@ def run_coin_trader(symbol: Optional[str] = None):
         if last_sl_time is not None:
             seconds_since_sl = (now - last_sl_time).total_seconds()
             if seconds_since_sl < settings.SL_COOLDOWN_MINUTES * 60:
-                mins_left = int((settings.SL_COOLDOWN_MINUTES * 60 - seconds_since_sl) // 60) + 1
+                mins_left = math.ceil((settings.SL_COOLDOWN_MINUTES * 60 - seconds_since_sl) / 60)
                 print(f"[{symbol}] [{now.strftime('%H:%M')}] SL cooldown active ({mins_left}m remaining)")
                 time.sleep(60)
                 continue
@@ -617,7 +709,7 @@ def run_coin_trader(symbol: Optional[str] = None):
         if last_tp_time is not None:
             seconds_since_tp = (now - last_tp_time).total_seconds()
             if seconds_since_tp < settings.TP_COOLDOWN_MINUTES * 60:
-                mins_left = int((settings.TP_COOLDOWN_MINUTES * 60 - seconds_since_tp) // 60) + 1
+                mins_left = math.ceil((settings.TP_COOLDOWN_MINUTES * 60 - seconds_since_tp) / 60)
                 print(f"[{symbol}] [{now.strftime('%H:%M')}] TP cooldown active ({mins_left}m remaining)")
                 time.sleep(60)
                 continue
@@ -628,7 +720,12 @@ def run_coin_trader(symbol: Optional[str] = None):
         try:
             df = fetch_ohlcv(symbol, '5m', limit=settings.LIVE_CANDLES)
             df = add_features(df)
-            signal = generate_signal(model, scaler, encoder, df)
+            signal = generate_signal(model, scaler, encoder, df,
+                                     base_rate_bullish=(metadata or {}).get('base_rate_bullish'))
+            # Captured before any filter rewrites the action; pyramids and the CHOP block use it
+            raw_action = signal.get('action')
+            if raw_action == 'CHOP':
+                last_chop_signal_time = now
 
             # -------------------------------------------------------------
             # STEP 1: CHECK BTC MACRO REGIME FIRST (Circuit Breaker)
@@ -647,6 +744,7 @@ def run_coin_trader(symbol: Optional[str] = None):
             coin = symbol.split('/')[0]
             liq, levels = get_liq_data(coin, current_price)
 
+            # None (feed down) and "insufficient data" (bias NEUTRAL, no spike) count as neutral
             if signal.get('action') == 'BUY' and liq:
                 if liq['bias'] == 'BEARISH' or liq['liq_spike']:
                     signal['action'] = None
@@ -671,7 +769,7 @@ def run_coin_trader(symbol: Optional[str] = None):
                 if not enter:
                     signal['action'] = None
 
-            elif signal.get('action') == 'SELL' and barrier_model is not None:
+            elif signal.get('action') == 'CHOP' and barrier_model is not None:
                 try:
                     barrier_probs = predict_barrier_probabilities(barrier_model, barrier_scaler, barrier_encoder, df)
                 except Exception:
@@ -681,10 +779,15 @@ def run_coin_trader(symbol: Optional[str] = None):
             # STEP 3: CALCULATE ENTRY / TP / SL & EXECUTE ORDER
             # -------------------------------------------------------------
             if signal.get('action') == 'BUY':
-                model_tp = signal.get('fib_target_pct', 0.03)
-                barrier_tp = barrier_probs.get('recommended_tp', 0.03) if barrier_model is not None else model_tp
-                effective_tp = max(model_tp, barrier_tp)
+                # EV-chosen tier; the directional model may only raise TP to a tier that is also +EV
+                effective_tp = barrier_probs['recommended_tp']
                 effective_sl = calculate_dynamic_sl(effective_tp)
+                model_tp = signal.get('fib_target_pct') or 0.0
+                if model_tp > effective_tp:
+                    model_tier = next((t for t in barrier_probs.get('ev_by_tier', []) if t['tp'] == model_tp), None)
+                    if model_tier is not None and model_tier['ev'] >= settings.MIN_EDGE_PCT:
+                        effective_tp = model_tp
+                        effective_sl = calculate_dynamic_sl(effective_tp)
 
                 if btc_bias == 'BULLISH':
                     entry_price = current_price
@@ -700,19 +803,17 @@ def run_coin_trader(symbol: Optional[str] = None):
                 signal['sl_pct'] = effective_sl
                 signal['order_type'] = order_type
 
-            elif signal.get('action') == 'SELL':
-                target_pct = signal.get('fib_target_pct', 0.03)
-                max_sl = getattr(settings, 'MAX_RISK_PER_TRADE', 0.03)
-                effective_sl = calculate_dynamic_sl(target_pct, max_sl)
+            elif signal.get('action') == 'CHOP':
                 signal['entry'] = current_price
-                signal['take_profit'] = round(current_price * (1 - target_pct), decimals)
-                signal['stop_loss'] = round(current_price * (1 + effective_sl), decimals)
-                signal['tp_pct'] = target_pct
-                signal['sl_pct'] = effective_sl
                 signal['order_type'] = 'signal_only'
                 signal['open_positions_count'] = len(open_positions)
 
-            liq_info = f"Liq: {liq['bias']} ({liq['liq_ratio']:.0%})" if liq else "Liq: N/A"
+            if not liq:
+                liq_info = "Liq: N/A"
+            elif liq.get('comment') == 'insufficient data':
+                liq_info = "Liq: NEUTRAL (insufficient)"
+            else:
+                liq_info = f"Liq: {liq['bias']} ({liq['liq_ratio']:.0%})"
             btc_info = f"BTC: {btc_bias}"
             print(
                 f"[{symbol}] [{now.strftime('%H:%M')}] "
@@ -724,7 +825,7 @@ def run_coin_trader(symbol: Optional[str] = None):
             )
 
             if signal.get('action') == 'BUY':
-                last_sell_alert_time = None
+                last_chop_alert_time = None
                 level_text = ""
                 if levels:
                     level_text = "\n\n🗺 <b>Nearby Liq Levels:</b>\n"
@@ -744,12 +845,13 @@ def run_coin_trader(symbol: Optional[str] = None):
                 daily_trades += 1
                 save_bot_state(symbol, open_positions, daily_trades, daily_pnl, last_day)
 
-            elif signal.get('action') == 'SELL':
+            elif signal.get('action') == 'CHOP':
                 # ── Notification Alert Only (DO NOT execute on Binance) ──
-                cooldown_sec = getattr(settings, 'SELL_ALERT_COOLDOWN_MINUTES', 30.0) * 60
+                cooldown_min = settings.CHOP_ALERT_COOLDOWN_MINUTES or settings.SELL_ALERT_COOLDOWN_MINUTES
+                cooldown_sec = cooldown_min * 60
                 can_alert = (
-                    last_sell_alert_time is None
-                    or (now - last_sell_alert_time).total_seconds() >= cooldown_sec
+                    last_chop_alert_time is None
+                    or (now - last_chop_alert_time).total_seconds() >= cooldown_sec
                 )
                 if can_alert:
                     level_text = ""
@@ -767,12 +869,40 @@ def run_coin_trader(symbol: Optional[str] = None):
                         symbol=symbol,
                         chat_id=settings.TELEGRAM_ERROR_CHAT_ID,
                     )
-                    last_sell_alert_time = now
-                    print(f"[{symbol}] [{now.strftime('%H:%M')}] 🔴 Sent SELL alert (signal only — not executed on Binance)")
+                    last_chop_alert_time = now
+                    print(f"[{symbol}] [{now.strftime('%H:%M')}] ⚪ Sent CHOP alert (signal only — not executed on Binance)")
                 else:
-                    secs_left = cooldown_sec - (now - last_sell_alert_time).total_seconds()
-                    mins_left = int(secs_left // 60) + 1
-                    print(f"[{symbol}] [{now.strftime('%H:%M')}] SELL signal active (throttled, {mins_left}m alert cooldown remaining)")
+                    secs_left = cooldown_sec - (now - last_chop_alert_time).total_seconds()
+                    mins_left = math.ceil(secs_left / 60)
+                    print(f"[{symbol}] [{now.strftime('%H:%M')}] CHOP signal active (throttled, {mins_left}m alert cooldown remaining)")
+
+            # Pyramiding: only reached after the trade-cap, loss-limit and cooldown gates above
+            if open_positions and signal.get('action') != 'BUY':
+                try:
+                    rung, pyr_reason = try_pyramid(
+                        symbol, open_positions, df, current_price, decimals, now, raw_action,
+                        btc_bias, liq, last_chop_signal_time,
+                        barrier_model, barrier_scaler, barrier_encoder,
+                    )
+                except Exception as e:
+                    rung, pyr_reason = None, f"pyramid check error: {e}"
+
+                if rung is not None:
+                    open_positions.append(rung)
+                    daily_trades += 1
+                    print(f"[{symbol}] [{now.strftime('%H:%M')}] 🔼 Pyramid @ {rung['entry']} | "
+                          f"TP {rung['take_profit']} | SL {rung['stop_loss']} | {pyr_reason}")
+                    send_message(
+                        f"🔼 <b>[{symbol}] Pyramid entry #{len(open_positions)} (half size, pending fill)</b>\n\n"
+                        f"💰 Entry: <b>{rung['entry']}</b>\n"
+                        f"💵 Size:  <b>{settings.QUOTE_AMOUNT_PER_TRADE * rung['size_mult']:.2f} USDT</b>\n"
+                        f"🎯 TP:    <b>{rung['take_profit']} (+{rung['tp_pct']*100:.1f}% Fib)</b>\n"
+                        f"🛑 SL:    <b>{rung['stop_loss']} (-{rung['sl_pct']*100:.1f}%)</b>\n"
+                        f"📊 {pyr_reason}"
+                    )
+                    save_bot_state(symbol, open_positions, daily_trades, daily_pnl, last_day)
+                else:
+                    print(f"[{symbol}] [{now.strftime('%H:%M')}] Pyramid skipped: {pyr_reason}")
         except Exception as e:
             notify_error(f"[{symbol}] {e}")
             print(f"[{symbol}] [{now.strftime('%H:%M')}] Error: {e}")

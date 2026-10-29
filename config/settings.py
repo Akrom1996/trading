@@ -35,8 +35,8 @@ try:
         # Trading Execution Parameters
         QUOTE_AMOUNT_PER_TRADE: float = Field(default=20.0, description="USDT allocated per trade entry")
         ENTRY_OFFSET_PCT: float = Field(default=0.003, description="Limit buy offset below current market price (0.3%)")
-        SL_COOLDOWN_MINUTES: float = Field(default=30.0, description="Cooldown period after a Stop Loss hit in minutes")
-        TP_COOLDOWN_MINUTES: float = Field(default=10.0, description="Cooldown period after a Take Profit hit in minutes")
+        SL_COOLDOWN_MINUTES: int = Field(default=30, description="Cooldown period after a Stop Loss hit in minutes")
+        TP_COOLDOWN_MINUTES: int = Field(default=10, description="Cooldown period after a Take Profit hit in minutes")
         SELL_ALERT_COOLDOWN_MINUTES: float = Field(default=30.0, description="Cooldown period between Telegram SELL alerts in minutes")
         MAX_TRADES_PER_DAY: int = Field(default=10, description="Maximum entries allowed per 24h cycle")
         MAX_RISK_PER_TRADE: float = Field(default=0.03, description="Maximum risk per trade (fraction)")
@@ -54,6 +54,18 @@ try:
         MAX_PYRAMID_POSITIONS: int = Field(default=6, description="Max stacked positions per symbol")
         PYRAMID_TRIGGER_PCT: float = Field(default=0.002, description="Threshold near TP to evaluate pyramid entry")
         PENDING_FILL_TIMEOUT_MINUTES: int = Field(default=15, description="Timeout before canceling unfilled limit order")
+
+        # Pyramiding / risk / model gates
+        PYRAMID_SIZE_MULT: float = Field(default=0.5, description="Pyramid rung size as a fraction of QUOTE_AMOUNT_PER_TRADE")
+        PYRAMID_CHOP_BLOCK_MINUTES: int = Field(default=30, description="Block pyramids for this long after any CHOP signal")
+        PYRAMID_REQUIRE_LIQ_FEED: bool = Field(default=True, description="Only pyramid while the liquidation feed is connected")
+        MAX_OPEN_RISK_PCT: float = Field(default=0.03, description="Max summed stop distance (size-weighted) across open positions")
+        FEE_ROUND_TRIP: float = Field(default=0.002, description="Round-trip trading fee fraction used in EV calculations")
+        MIN_EDGE_PCT: float = Field(default=0.003, description="Minimum expected value (net of fees) required to enter")
+        SIGNAL_MARGIN: float = Field(default=0.10, description="Required P(bullish) margin above the training base rate")
+        LIQ_MIN_EVENTS: int = Field(default=3, description="Min liquidation events in window before a liq bias is trusted")
+        LIQ_MIN_NOTIONAL_USD: float = Field(default=20000.0, description="Min liquidation notional in window before a liq bias is trusted")
+        CHOP_ALERT_COOLDOWN_MINUTES: Optional[int] = Field(default=None, description="Cooldown between CHOP alerts (falls back to SELL_ALERT_COOLDOWN_MINUTES)")
 
         # Database & Cache Persistence
         DB_PATH: str = Field(default="data/bot_data.db", description="Path to SQLite database")
@@ -96,8 +108,8 @@ except ImportError:
 
             self.QUOTE_AMOUNT_PER_TRADE = float(os.getenv("QUOTE_AMOUNT_PER_TRADE", "20.0"))
             self.ENTRY_OFFSET_PCT = float(os.getenv("ENTRY_OFFSET_PCT", "0.003"))
-            self.SL_COOLDOWN_MINUTES = float(os.getenv("SL_COOLDOWN_MINUTES", "30.0"))
-            self.TP_COOLDOWN_MINUTES = float(os.getenv("TP_COOLDOWN_MINUTES", "10.0"))
+            self.SL_COOLDOWN_MINUTES = int(os.getenv("SL_COOLDOWN_MINUTES", "30"))
+            self.TP_COOLDOWN_MINUTES = int(os.getenv("TP_COOLDOWN_MINUTES", "10"))
             self.SELL_ALERT_COOLDOWN_MINUTES = float(os.getenv("SELL_ALERT_COOLDOWN_MINUTES", "30.0"))
             self.MAX_TRADES_PER_DAY = int(os.getenv("MAX_TRADES_PER_DAY", "10"))
             self.MAX_RISK_PER_TRADE = float(os.getenv("MAX_RISK_PER_TRADE", "0.03"))
@@ -113,6 +125,18 @@ except ImportError:
             self.MAX_PYRAMID_POSITIONS = int(os.getenv("MAX_PYRAMID_POSITIONS", "6"))
             self.PYRAMID_TRIGGER_PCT = float(os.getenv("PYRAMID_TRIGGER_PCT", "0.002"))
             self.PENDING_FILL_TIMEOUT_MINUTES = int(os.getenv("PENDING_FILL_TIMEOUT_MINUTES", "15"))
+
+            self.PYRAMID_SIZE_MULT = float(os.getenv("PYRAMID_SIZE_MULT", "0.5"))
+            self.PYRAMID_CHOP_BLOCK_MINUTES = int(os.getenv("PYRAMID_CHOP_BLOCK_MINUTES", "30"))
+            self.PYRAMID_REQUIRE_LIQ_FEED = _parse_bool(os.getenv("PYRAMID_REQUIRE_LIQ_FEED"), True)
+            self.MAX_OPEN_RISK_PCT = float(os.getenv("MAX_OPEN_RISK_PCT", "0.03"))
+            self.FEE_ROUND_TRIP = float(os.getenv("FEE_ROUND_TRIP", "0.002"))
+            self.MIN_EDGE_PCT = float(os.getenv("MIN_EDGE_PCT", "0.003"))
+            self.SIGNAL_MARGIN = float(os.getenv("SIGNAL_MARGIN", "0.10"))
+            self.LIQ_MIN_EVENTS = int(os.getenv("LIQ_MIN_EVENTS", "3"))
+            self.LIQ_MIN_NOTIONAL_USD = float(os.getenv("LIQ_MIN_NOTIONAL_USD", "20000"))
+            _chop_cd = os.getenv("CHOP_ALERT_COOLDOWN_MINUTES")
+            self.CHOP_ALERT_COOLDOWN_MINUTES = int(_chop_cd) if _chop_cd else None
 
             self.DB_PATH = os.getenv("DB_PATH", "data/bot_data.db")
             self.REDIS_URL = os.getenv("REDIS_URL")
