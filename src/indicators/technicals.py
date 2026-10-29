@@ -14,7 +14,6 @@ try:
     import pandas as pd
     import ta
     from sklearn.preprocessing import StandardScaler, LabelEncoder
-    from sklearn.utils.class_weight import compute_sample_weight
     from xgboost import XGBClassifier
     HAS_ML_DEPS = True
 except ImportError:
@@ -52,6 +51,8 @@ DEFAULT_TP_PCT = 0.03
 TP_PCT = DEFAULT_TP_PCT
 SL_PCT = DEFAULT_SL_PCT
 
+TIER_CHOP = 0
+
 LABEL_SL_FIRST = 0
 LABEL_FIB_1 = 1
 LABEL_FIB_2 = 2
@@ -62,7 +63,7 @@ LABEL_TIMEOUT = 7  # kept at 7 on purpose: old models with class 6 (former FIB_1
 LABEL_TP_FIRST = LABEL_FIB_2
 
 LABEL_NAMES = {
-    LABEL_SL_FIRST: f"SL_FIRST (-{SL_PCT*100:.1f}%)",
+    LABEL_SL_FIRST: f"SL_FIRST (tier-1 -{FIBONACCI_LEVELS[0]*100:.0f}%)",
     LABEL_FIB_1: "TP_FIB_1 (+1%)",
     LABEL_FIB_2: "TP_FIB_2 (+2%)",
     LABEL_FIB_3: "TP_FIB_3 (+3%)",
@@ -88,7 +89,10 @@ FLOW_WINDOW = 288  # candles for rolling VWAP / OBV (1 day of 5m); must stay wel
 
 # Bump when a feature's definition changes without changing the column count,
 # so models saved with the old definition are retrained instead of reused.
-FEATURE_VERSION = 2  # v2: rolling VWAP / OBV instead of cumulative
+FEATURE_VERSION = 3  # v2: rolling VWAP / OBV instead of cumulative; v3: per-tier stops in labels
+
+OOS_TEST_FRACTION = 0.2
+WIN_COLUMNS = [f'win_tier_{k}' for k in range(1, len(FIBONACCI_LEVELS) + 1)]
 
 
 def _labels_are_valid(encoder: Any) -> bool:
@@ -210,34 +214,104 @@ def _forward_peak_gains(df: pd.DataFrame, horizon: int, sl_pct: float) -> Tuple[
     return peak_gain, stopped_out
 
 
-def add_labels(df: pd.DataFrame, horizon: int = LABEL_HORIZON_CANDLES, sl_pct: Optional[float] = None) -> pd.DataFrame:
-    """Labels forward Fibonacci expansion tiers reached before SL."""
-    if sl_pct is None:
-        sl_pct = getattr(settings, 'MAX_RISK_PER_TRADE', DEFAULT_SL_PCT)
-    peak_gain, _ = _forward_peak_gains(df, horizon, sl_pct)
+def tier_stop_pct(level: float) -> float:
+    """Live stop for a tier: SL = min(TP, MAX_RISK_PER_TRADE)."""
+    return min(level, getattr(settings, 'MAX_RISK_PER_TRADE', DEFAULT_SL_PCT))
 
-    # Tiers 0..5 for <1%, 1%, 2%, 3%, 5%, 8%+
-    labels = np.searchsorted(FIBONACCI_LEVELS, peak_gain, side='right')
 
-    out = df.iloc[:len(peak_gain)].copy()
+def _tier_outcomes(df: pd.DataFrame, horizon: int = LABEL_HORIZON_CANDLES) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Per-tier trade outcomes matching live execution: tier k (level L) wins if the high
+    reaches entry*(1+L) before the low hits entry*(1-min(L, cap)). A candle that crosses
+    both counts as a loss (_forward_peak_gains only uses highs before the stop candle).
+    Returns (wins[n, len(FIBONACCI_LEVELS)], tier-1 trade stopped out[n]).
+    """
+    gains_by_sl: Dict[float, np.ndarray] = {}
+    stopped_by_sl: Dict[float, np.ndarray] = {}
+    for level in FIBONACCI_LEVELS:
+        sl = tier_stop_pct(level)
+        if sl not in gains_by_sl:
+            gains_by_sl[sl], stopped_by_sl[sl] = _forward_peak_gains(df, horizon, sl)
+
+    wins = np.column_stack([
+        gains_by_sl[tier_stop_pct(level)] >= level for level in FIBONACCI_LEVELS
+    ]) if len(df) > horizon else np.zeros((0, len(FIBONACCI_LEVELS)), dtype=bool)
+    first_sl = tier_stop_pct(FIBONACCI_LEVELS[0])
+    stopped_tier1 = stopped_by_sl[first_sl] & ~wins[:, 0] if len(wins) else np.zeros(0, dtype=bool)
+    return wins, stopped_tier1
+
+
+def _highest_winning_tier(wins: np.ndarray) -> np.ndarray:
+    """1-based index of the highest winning tier per row, 0 if none won."""
+    n_tiers = wins.shape[1]
+    return np.where(wins.any(axis=1), n_tiers - np.argmax(wins[:, ::-1], axis=1), 0)
+
+
+def add_labels(df: pd.DataFrame, horizon: int = LABEL_HORIZON_CANDLES) -> pd.DataFrame:
+    """Labels the highest Fibonacci tier won with its live stop (min(TP, cap)), 0 if none."""
+    peak_gain, _ = _forward_peak_gains(df, horizon, getattr(settings, 'MAX_RISK_PER_TRADE', DEFAULT_SL_PCT))
+    wins, _ = _tier_outcomes(df, horizon)
+
+    # Tiers 0..5 for none, 1%, 2%, 3%, 5%, 8%
+    labels = _highest_winning_tier(wins)
+
+    out = df.iloc[:len(labels)].copy()
     out['max_gain'] = peak_gain
     out['label'] = labels.astype(int)
+    out[WIN_COLUMNS] = wins
     return out.reset_index(drop=True)
 
 
-def label_triple_barrier(df: pd.DataFrame, horizon: int = LABEL_HORIZON_CANDLES, sl_pct: Optional[float] = None, tp_pct: float = DEFAULT_TP_PCT) -> pd.DataFrame:
-    """Triple-barrier labeling for spot trades."""
-    if sl_pct is None:
-        sl_pct = getattr(settings, 'MAX_RISK_PER_TRADE', SL_PCT)
-    peak_gain, stopped_out = _forward_peak_gains(df, horizon, sl_pct)
+def label_triple_barrier(df: pd.DataFrame, horizon: int = LABEL_HORIZON_CANDLES) -> pd.DataFrame:
+    """Triple-barrier labeling for spot trades, one live stop per tier."""
+    wins, stopped_tier1 = _tier_outcomes(df, horizon)
 
-    # FIB tiers share numbering with add_labels (1..5); below 1% split into SL_FIRST vs TIMEOUT
-    tiers = np.searchsorted(FIBONACCI_LEVELS, peak_gain, side='right')
-    labels = np.where(tiers > 0, tiers, np.where(stopped_out, LABEL_SL_FIRST, LABEL_TIMEOUT))
+    # FIB tiers share numbering with add_labels (1..5); no win splits into SL_FIRST vs TIMEOUT
+    tiers = _highest_winning_tier(wins)
+    labels = np.where(tiers > 0, tiers, np.where(stopped_tier1, LABEL_SL_FIRST, LABEL_TIMEOUT))
 
-    out = df.iloc[:len(peak_gain)].copy()
+    out = df.iloc[:len(labels)].copy()
     out['barrier_label'] = labels.astype(int)
+    out[WIN_COLUMNS] = wins
     return out
+
+
+def _purged_split(n: int, horizon: int = LABEL_HORIZON_CANDLES) -> Tuple[np.ndarray, np.ndarray]:
+    """Time-ordered split: last OOS_TEST_FRACTION is test; the horizon rows before it are purged."""
+    test_start = int(n * (1 - OOS_TEST_FRACTION))
+    train_end = max(test_start - horizon, 0)
+    return np.arange(train_end), np.arange(test_start, n)
+
+
+def _make_classifier(num_classes: int, **extra) -> Any:
+    is_multiclass = num_classes > 2
+    return XGBClassifier(
+        n_estimators=300,
+        max_depth=5,
+        learning_rate=0.05,
+        objective='multi:softprob' if is_multiclass else 'binary:logistic',
+        num_class=num_classes if is_multiclass else None,
+        eval_metric='mlogloss',
+        random_state=42,
+        n_jobs=-1,
+        **extra,
+    )
+
+
+def _fit_holdout(X: pd.DataFrame, y: pd.Series, train_idx: np.ndarray, test_idx: np.ndarray, **extra):
+    """Fits scaler + encoder + model on train rows only; returns (test probabilities, encoder) or None."""
+    if len(train_idx) == 0 or len(test_idx) == 0:
+        return None
+    y_train = y.iloc[train_idx]
+    if y_train.nunique() < 2:
+        return None
+    encoder = LabelEncoder()
+    y_enc = encoder.fit_transform(y_train)
+    scaler = StandardScaler()
+    model = _make_classifier(len(encoder.classes_), **extra)
+    model.fit(scaler.fit_transform(X.iloc[train_idx]), y_enc)
+    probs = model.predict_proba(scaler.transform(X.iloc[test_idx]))
+    return probs, encoder
 
 
 # ── Directional Model (train, save, load) ───────────────────────
@@ -260,44 +334,73 @@ def _get_model_paths(symbol: str) -> Dict[str, str]:
     }
 
 
-def train_model(df: pd.DataFrame) -> Tuple[Any, Any, Any]:
-    print("  Label distribution (Fibonacci Tiers):")
+def _directional_oos(df: pd.DataFrame, X: pd.DataFrame, y: pd.Series) -> Dict[str, Any]:
+    """Purged holdout stats for the directional model (logging only)."""
+    train_idx, test_idx = _purged_split(len(df))
+    fitted = _fit_holdout(X, y, train_idx, test_idx, subsample=0.8, colsample_bytree=0.8)
+    if fitted is None:
+        print("  OOS directional: not enough data for a holdout")
+        return {'test_rows': int(len(test_idx))}
+    probs, encoder = fitted
+    preds = encoder.classes_[probs.argmax(axis=1)].astype(int)
+    y_test = y.iloc[test_idx].to_numpy(dtype=int)
+    accuracy = float((preds == y_test).mean())
+
+    # A predicted tier k >= 1 is scored as the live trade at tier k: did it win?
+    buy_rows = preds >= 1
+    tier_wins = df.iloc[test_idx][WIN_COLUMNS].to_numpy(dtype=bool)
+    buy_wins = tier_wins[np.flatnonzero(buy_rows), preds[buy_rows] - 1]
+    buy_win_rate = float(buy_wins.mean()) if buy_rows.any() else None
+    stats = {
+        'test_rows': int(len(test_idx)),
+        'accuracy': round(accuracy, 4),
+        'buy_rate': round(float(buy_rows.mean()), 4),
+        'buy_win_rate': round(buy_win_rate, 4) if buy_win_rate is not None else None,
+    }
+    win_str = f"{buy_win_rate:.0%}" if buy_win_rate is not None else "n/a"
+    print(f"  OOS directional: test={stats['test_rows']} acc={accuracy:.1%} "
+          f"buy_rate={stats['buy_rate']:.1%} buy_win={win_str}")
+    return stats
+
+
+def train_model(df: pd.DataFrame) -> Tuple[Any, Any, Any, Dict[str, Any]]:
+    cap = getattr(settings, 'MAX_RISK_PER_TRADE', DEFAULT_SL_PCT)
+    print(f"  Label distribution (Fibonacci Tiers, stop per tier = min(TP, {cap*100:.1f}%)):")
     total = len(df)
+    class_freqs: Dict[int, float] = {}
     for tier, name in FIB_TIER_NAMES.items():
         count = int((df['label'] == tier).sum())
         pct = (count / total * 100) if total else 0.0
+        class_freqs[tier] = round(count / total, 4) if total else 0.0
         if count > 0:
             print(f"    Tier {tier} ({name:22s}): {count:5d} ({pct:.1f}%)")
 
     X = df[FEATURES]
     y = df['label']
+    base_rate_bullish = float((y >= 1).mean()) if total else 0.0
+    print(f"  Base rate P(bullish tier) = {base_rate_bullish:.1%}")
+
+    oos = _directional_oos(df, X, y)
 
     encoder = LabelEncoder()
     y_encoded = encoder.fit_transform(y)
-    num_classes = len(encoder.classes_)
 
-    sample_weights = compute_sample_weight(class_weight='balanced', y=y_encoded)
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
 
-    is_multiclass = num_classes > 2
-    model = XGBClassifier(
-        n_estimators=300,
-        max_depth=5,
-        learning_rate=0.05,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        objective='multi:softprob' if is_multiclass else 'binary:logistic',
-        num_class=num_classes if is_multiclass else None,
-        eval_metric='mlogloss',
-        random_state=42,
-        n_jobs=-1,
-    )
-    model.fit(X_scaled, y_encoded, sample_weight=sample_weights)
-    return model, scaler, encoder
+    # No class weighting: probabilities must stay on the real-frequency scale of base_rate_bullish
+    model = _make_classifier(len(encoder.classes_), subsample=0.8, colsample_bytree=0.8)
+    model.fit(X_scaled, y_encoded)
+    train_meta = {
+        'class_freqs': class_freqs,
+        'base_rate_bullish': round(base_rate_bullish, 4),
+        'oos': oos,
+    }
+    return model, scaler, encoder, train_meta
 
 
-def save_model(model: Any, scaler: Any, encoder: Any, symbol: str, candles_count: Optional[int] = None):
+def save_model(model: Any, scaler: Any, encoder: Any, symbol: str, candles_count: Optional[int] = None,
+               extra_meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     paths = _get_model_paths(symbol)
     with open(paths['model'], 'wb') as f:
         pickle.dump(model, f)
@@ -305,14 +408,17 @@ def save_model(model: Any, scaler: Any, encoder: Any, symbol: str, candles_count
         pickle.dump(scaler, f)
     with open(paths['encoder'], 'wb') as f:
         pickle.dump(encoder, f)
+    metadata = {
+        'trained_at': datetime.now(),
+        'candles_count': candles_count,
+        'symbol': symbol,
+        'feature_version': FEATURE_VERSION,
+        **(extra_meta or {}),
+    }
     with open(paths['metadata'], 'wb') as f:
-        pickle.dump({
-            'trained_at': datetime.now(),
-            'candles_count': candles_count,
-            'symbol': symbol,
-            'feature_version': FEATURE_VERSION,
-        }, f)
+        pickle.dump(metadata, f)
     print(f"  Model saved to {paths['model']}")
+    return metadata
 
 
 def load_model(symbol: str) -> Tuple[Optional[Any], Optional[Any], Optional[Any], Optional[Dict[str, Any]]]:
@@ -352,6 +458,10 @@ def load_model(symbol: str) -> Tuple[Optional[Any], Optional[Any], Optional[Any]
             print(f"  Feature definitions changed (v{metadata.get('feature_version', 1)} -> v{FEATURE_VERSION}), retraining...")
             return None, None, None, None
 
+        if metadata.get('base_rate_bullish') is None:
+            print("  Model metadata has no class base rates, retraining...")
+            return None, None, None, None
+
         return model, scaler, encoder, metadata
     except Exception as e:
         print(f"  Load model error: {e}")
@@ -379,11 +489,75 @@ def _get_barrier_path(symbol: str) -> str:
     return os.path.join(base_dir, f"barrier_model_{safe}.pkl")
 
 
+def ev_entry_rule(full_probs: Dict[int, float]) -> Dict[str, Any]:
+    """
+    Expected value per tier k (level L, live stop S = min(L, cap)):
+        p_win_k = P(label >= k);  EV_k = p_win_k*L - (1 - p_win_k)*S - FEE_ROUND_TRIP
+    Picks the max-EV tier; enter only if EV >= MIN_EDGE_PCT.
+    """
+    fee = getattr(settings, 'FEE_ROUND_TRIP', 0.0)
+    min_edge = getattr(settings, 'MIN_EDGE_PCT', 0.0)
+    tier_labels = [LABEL_FIB_1, LABEL_FIB_2, LABEL_FIB_3, LABEL_FIB_5, LABEL_FIB_8]
+
+    ev_by_tier = []
+    for k, level in enumerate(FIBONACCI_LEVELS, start=1):
+        p_win = sum(full_probs.get(lbl, 0.0) for lbl in tier_labels[k - 1:])
+        sl = tier_stop_pct(level)
+        ev = p_win * level - (1 - p_win) * sl - fee
+        ev_by_tier.append({'tier': k, 'tp': level, 'sl': sl, 'p_win': p_win, 'ev': ev})
+
+    best = max(ev_by_tier, key=lambda t: t['ev'])
+    return {
+        'chosen_tier': best['tier'],
+        'ev': round(best['ev'], 5),
+        'p_win': round(best['p_win'], 4),
+        'recommended_tp': best['tp'],
+        'recommended_sl': round(best['sl'], 4),
+        'enter': best['ev'] >= min_edge,
+        'ev_by_tier': [{**t, 'p_win': round(t['p_win'], 4), 'ev': round(t['ev'], 5)} for t in ev_by_tier],
+    }
+
+
+def _barrier_oos(labeled: pd.DataFrame, X: pd.DataFrame, y: pd.Series) -> Dict[str, Any]:
+    """Purged holdout: rows the EV rule would enter, scored on their true per-tier outcome."""
+    train_idx, test_idx = _purged_split(len(labeled))
+    fitted = _fit_holdout(X, y, train_idx, test_idx)
+    if fitted is None:
+        print("  OOS barrier: not enough data for a holdout")
+        return {'test_rows': int(len(test_idx)), 'entered': 0}
+    probs, encoder = fitted
+    tier_wins = labeled.iloc[test_idx][WIN_COLUMNS].to_numpy(dtype=bool)
+    fee = getattr(settings, 'FEE_ROUND_TRIP', 0.0)
+
+    returns = []
+    for row, row_probs in enumerate(probs):
+        rule = ev_entry_rule({int(c): float(p) for c, p in zip(encoder.classes_, row_probs)})
+        if not rule['enter']:
+            continue
+        won = tier_wins[row, rule['chosen_tier'] - 1]
+        returns.append((rule['recommended_tp'] if won else -rule['recommended_sl']) - fee)
+
+    entered = len(returns)
+    stats = {
+        'test_rows': int(len(test_idx)),
+        'entered': entered,
+        'win_rate': round(float(np.mean([r > 0 for r in returns])), 4) if entered else None,
+        'avg_return': round(float(np.mean(returns)), 5) if entered else None,
+    }
+    if entered:
+        print(f"  OOS barrier: test={stats['test_rows']} entered={entered} "
+              f"win={stats['win_rate']:.0%} avg={stats['avg_return']*100:+.2f}% net")
+    else:
+        print(f"  OOS barrier: test={stats['test_rows']} entered=0 (EV rule never fires)")
+    return stats
+
+
 def train_barrier_model(df: pd.DataFrame, symbol: Optional[str] = None) -> Tuple[Any, Any, Any, Dict[str, Any]]:
     labeled = label_triple_barrier(df)
     total = len(labeled)
     label_stats = {}
-    print(f"  Label distribution{f' ({symbol})' if symbol else ''}:")
+    cap = getattr(settings, 'MAX_RISK_PER_TRADE', DEFAULT_SL_PCT)
+    print(f"  Label distribution{f' ({symbol})' if symbol else ''} (stop per tier = min(TP, {cap*100:.1f}%)):")
     for lbl, name in LABEL_NAMES.items():
         count = int((labeled['barrier_label'] == lbl).sum())
         pct = count / total * 100 if total else 0.0
@@ -394,26 +568,18 @@ def train_barrier_model(df: pd.DataFrame, symbol: Optional[str] = None) -> Tuple
     X = labeled[FEATURES]
     y = labeled['barrier_label']
 
+    oos = _barrier_oos(labeled, X, y)
+    label_stats['oos'] = oos
+
     encoder = LabelEncoder()
     y_encoded = encoder.fit_transform(y)
-    num_classes = len(encoder.classes_)
 
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
-    sample_weight = compute_sample_weight(class_weight='balanced', y=y_encoded)
 
-    is_multiclass = num_classes > 2
-    model = XGBClassifier(
-        n_estimators=300,
-        max_depth=5,
-        learning_rate=0.05,
-        objective='multi:softprob' if is_multiclass else 'binary:logistic',
-        num_class=num_classes if is_multiclass else None,
-        eval_metric='mlogloss',
-        random_state=42,
-        n_jobs=-1,
-    )
-    model.fit(X_scaled, y_encoded, sample_weight=sample_weight)
+    # Unweighted so predicted probabilities reflect real frequencies (the EV rule depends on it)
+    model = _make_classifier(len(encoder.classes_))
+    model.fit(X_scaled, y_encoded)
     return model, scaler, encoder, label_stats
 
 
@@ -428,6 +594,7 @@ def save_barrier_model(model: Any, scaler: Any, encoder: Any, symbol: str, candl
             'trained_at': datetime.now(),
             'candles_count': candles_count,
             'label_stats': label_stats,
+            'oos': (label_stats or {}).get('oos'),
             'feature_version': FEATURE_VERSION,
         }, f)
 
@@ -474,15 +641,7 @@ def predict_barrier_probabilities(model: Any, scaler: Any, encoder: Any, df_late
     p_profitable = p_fib_1 + p_fib_2 + p_fib_3 + p_fib_5 + p_fib_8
     p_extended = p_fib_3 + p_fib_5 + p_fib_8
 
-    recommended_tp = 0.02
-    if p_fib_8 >= 0.15:
-        recommended_tp = 0.08
-    elif (p_fib_5 + p_fib_8) >= 0.20:
-        recommended_tp = 0.05
-    elif p_extended >= 0.25:
-        recommended_tp = 0.03
-    elif p_profitable >= 0.35:
-        recommended_tp = 0.02
+    rule = ev_entry_rule(full_probs)
 
     return {
         'p_sl_first': round(full_probs[LABEL_SL_FIRST], 4),
@@ -494,22 +653,27 @@ def predict_barrier_probabilities(model: Any, scaler: Any, encoder: Any, df_late
         'p_fib_3': round(p_fib_3, 4),
         'p_fib_5': round(p_fib_5, 4),
         'p_fib_8': round(p_fib_8, 4),
-        'recommended_tp': recommended_tp,
+        **rule,
     }
 
 
-def should_enter(barrier_probs: Dict[str, Any], min_profit_prob: float = 0.35) -> Tuple[bool, str]:
-    p = barrier_probs['p_tp_first']
-    rec_tp = barrier_probs.get('recommended_tp', DEFAULT_TP_PCT)
-    sl = getattr(settings, 'MAX_RISK_PER_TRADE', SL_PCT)
-    if p >= min_profit_prob:
-        return True, f"P(Fib profit before -{sl*100:.1f}%)={p:.0%} (Target: +{rec_tp*100:.0f}%) — entering"
-    return False, f"P(Fib profit before -{sl*100:.1f}%)={p:.0%} below {min_profit_prob:.0%} threshold — skipping"
+def should_enter(barrier_probs: Dict[str, Any]) -> Tuple[bool, str]:
+    tp = barrier_probs.get('recommended_tp', DEFAULT_TP_PCT)
+    sl = barrier_probs.get('recommended_sl', tier_stop_pct(tp))
+    p = barrier_probs.get('p_win', 0.0)
+    ev = barrier_probs.get('ev', 0.0)
+    min_edge = getattr(settings, 'MIN_EDGE_PCT', 0.0)
+    desc = (f"Tier {barrier_probs.get('chosen_tier')} +{tp*100:.0f}%/-{sl*100:.1f}%: "
+            f"P(win)={p:.0%}, EV={ev*100:+.2f}% net")
+    if barrier_probs.get('enter'):
+        return True, f"{desc} ≥ {min_edge*100:.2f}% edge — entering"
+    return False, f"{desc} below {min_edge*100:.2f}% edge — skipping"
 
 
 # ── Signal Generation ───────────────────────────────────────────
 
-def generate_signal(model: Any, scaler: Any, encoder: Any, df: pd.DataFrame, min_confidence: float = 0.40) -> Dict[str, Any]:
+def generate_signal(model: Any, scaler: Any, encoder: Any, df: pd.DataFrame, min_confidence: float = 0.40,
+                    base_rate_bullish: Optional[float] = None) -> Dict[str, Any]:
     latest = df[FEATURES].iloc[-1:].copy()
     scaled = scaler.transform(latest)
 
@@ -520,15 +684,20 @@ def generate_signal(model: Any, scaler: Any, encoder: Any, df: pd.DataFrame, min
     pred = encoder.inverse_transform([pred_enc])[0]
     class_probs = {cls: prob for cls, prob in zip(encoder.classes_, proba)}
     p_bullish = sum(prob for cls, prob in class_probs.items() if cls >= 1)
-    p_sl_first = class_probs.get(LABEL_SL_FIRST, 0.0)
+    p_chop = class_probs.get(TIER_CHOP, 0.0)
 
     current_price = float(df['close'].iloc[-1])
+
+    # Bullish shortcut only counts if P(bullish) clears the training base rate by SIGNAL_MARGIN
+    bullish_edge = (base_rate_bullish is not None
+                    and p_bullish >= base_rate_bullish + getattr(settings, 'SIGNAL_MARGIN', 0.0))
 
     signal = {
         'action': None,
         'confidence': confidence,
         'p_bullish': round(p_bullish, 4),
-        'p_sl_first': round(p_sl_first, 4),
+        'p_chop': round(p_chop, 4),
+        'p_sl_first': round(p_chop, 4),
         'pred_label': int(pred),
         'fib_tier': int(pred) if pred >= 1 else 0,
         'fib_target_pct': TIER_TO_PCT.get(int(pred), 0.02),
@@ -537,7 +706,7 @@ def generate_signal(model: Any, scaler: Any, encoder: Any, df: pd.DataFrame, min
         'stop_loss': None,
     }
 
-    if pred >= 1 and (confidence >= min_confidence or p_bullish >= 0.45):
+    if pred >= 1 and (confidence >= min_confidence or bullish_edge):
         target_pct = TIER_TO_PCT.get(int(pred), 0.03)
         max_sl = getattr(settings, 'MAX_RISK_PER_TRADE', SL_PCT)
         sl_pct = round(min(target_pct, max_sl), 4)
@@ -547,16 +716,10 @@ def generate_signal(model: Any, scaler: Any, encoder: Any, df: pd.DataFrame, min
         signal['sl_pct'] = sl_pct
         signal['take_profit'] = round(current_price * (1.0 + target_pct), 4)
         signal['stop_loss'] = round(current_price * (1.0 - sl_pct), 4)
-    elif (pred == LABEL_SL_FIRST or pred == -1) and (confidence >= min_confidence or p_sl_first >= 0.45):
-        target_pct = 0.03
-        max_sl = getattr(settings, 'MAX_RISK_PER_TRADE', SL_PCT)
-        sl_pct = round(min(target_pct, max_sl), 4)
-        signal['action'] = 'SELL'
-        signal['fib_target_pct'] = target_pct
-        signal['tp_pct'] = target_pct
-        signal['sl_pct'] = sl_pct
-        signal['take_profit'] = round(current_price * (1.0 - target_pct), 4)
-        signal['stop_loss'] = round(current_price * (1.0 + sl_pct), 4)
+    elif pred == TIER_CHOP and confidence >= min_confidence:
+        # Class 0 means "no tier reached" (chop), not a bearish call
+        signal['action'] = 'CHOP'
+        signal['fib_target_pct'] = None
         signal['order_type'] = 'signal_only'
 
     return signal

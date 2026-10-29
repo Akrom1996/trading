@@ -125,6 +125,24 @@ class BinanceClient:
         exchange = self.get_exchange()
         return exchange.fetch_order_book(symbol, limit=limit)
 
+    def get_min_notional(self, symbol: str) -> Optional[float]:
+        """Exchange minimum order value (quote currency) for a symbol, or None if unknown."""
+        try:
+            market = (self.get_exchange().markets or {}).get(symbol)
+        except Exception:
+            return None
+        if not market:
+            return None
+        cost_min = ((market.get('limits') or {}).get('cost') or {}).get('min')
+        if cost_min:
+            return float(cost_min)
+        for f in (market.get('info') or {}).get('filters', []):
+            if f.get('filterType') in ('NOTIONAL', 'MIN_NOTIONAL'):
+                value = f.get('minNotional')
+                if value:
+                    return float(value)
+        return None
+
     # ── Private Account & Orders ────────────────────────────────
 
     def get_available_balance(self, asset: str) -> float:
@@ -496,4 +514,5 @@ def place_market_sell(symbol: str, base_amount: float) -> Dict[str, Any]:
 def cancel_oco(symbol: str, oco_id: Any) -> bool:
     return get_binance_client().cancel_oco(symbol, oco_id)
 
-
+def get_min_notional(symbol: str) -> Optional[float]:
+    return get_binance_client().get_min_notional(symbol)

@@ -59,7 +59,8 @@ class TelegramNotifier:
         chat_id: Optional[str] = None,
     ):
         is_sell = signal.get('action') == 'SELL'
-        emoji = '🔴' if is_sell else '🟢'
+        is_chop = signal.get('action') == 'CHOP'
+        emoji = '⚪' if is_chop else '🔴' if is_sell else '🟢'
         liq_emoji = '🐻' if liq and liq.get('bias') == 'BEARISH' else '🐂' if liq and liq.get('bias') == 'BULLISH' else '⚖️'
 
         liq_section = ""
@@ -78,7 +79,9 @@ class TelegramNotifier:
         sl_str = (f" (+{sl_target*100:.1f}%)" if is_sell else f" (-{sl_target*100:.1f}%)") if sl_target else ""
         
         p_bull = signal.get('p_bullish')
-        if is_sell:
+        if is_chop:
+            conf_str = f"{signal.get('confidence', 0):.0%} (Chop: {signal.get('p_chop', 0):.0%})"
+        elif is_sell:
             p_bear = 1.0 - p_bull if p_bull is not None else signal.get('p_sl_first', signal.get('confidence', 0))
             conf_str = f"{signal.get('confidence', 0):.0%}" + f" (Bearish: {p_bear:.0%})"
         else:
@@ -93,7 +96,14 @@ class TelegramNotifier:
             order_type_str = ""
 
         warning_section = ""
-        if is_sell:
+        if is_chop:
+            pos_count = signal.get('open_positions_count', 0)
+            pos_note = f"ℹ️ You have <b>{pos_count}</b> open position(s) on {symbol}.\n" if pos_count > 0 else ""
+            warning_section = (
+                f"\n\n{pos_note}"
+                f"ℹ️ <i>Model sees chop / no edge — informational, no order placed.</i>"
+            )
+        elif is_sell:
             pos_count = signal.get('open_positions_count', 0)
             pos_warning = f"⚠️ <b>Warning:</b> You currently have <b>{pos_count}</b> open position(s) on {symbol}!\n\n" if pos_count > 0 else ""
             warning_section = (
@@ -101,40 +111,52 @@ class TelegramNotifier:
                 f"ℹ️ <i>Market is turning BEARISH. This is an informational alert — no order placed on Binance.</i>"
             )
 
+        levels_str = "" if is_chop else (
+            f"🎯 Take Profit: <b>{signal.get('take_profit')}</b>{fib_str}\n"
+            f"🛑 Stop Loss:   <b>{signal.get('stop_loss')}</b>{sl_str}\n"
+        )
         msg = (
             f"{emoji} <b>{signal.get('action')} Signal{order_type_str} — {symbol}</b>\n\n"
             f"💰 Price:       <b>{signal.get('entry')}</b>\n"
-            f"🎯 Take Profit: <b>{signal.get('take_profit')}</b>{fib_str}\n"
-            f"🛑 Stop Loss:   <b>{signal.get('stop_loss')}</b>{sl_str}\n"
+            f"{levels_str}"
             f"📊 Confidence:  <b>{conf_str}</b>\n"
             f"🔢 Trade:       <b>{daily_trades}/{settings.MAX_TRADES_PER_DAY}</b>"
             f"{liq_section}"
             f"{level_text}"
             f"{warning_section}"
         )
-        target_chat = chat_id or (self.error_chat_id if is_sell else self.chat_id)
+        target_chat = chat_id or (self.error_chat_id if (is_sell or is_chop) else self.chat_id)
         self.send_message(msg, chat_id=target_chat)
 
     def notify_signal(self, signal: Dict[str, Any], daily_trades: int, symbol: str = 'SOL/USDT', chat_id: Optional[str] = None):
         is_sell = signal.get('action') == 'SELL'
-        emoji = '🔴' if is_sell else '🟢'
+        is_chop = signal.get('action') == 'CHOP'
+        emoji = '⚪' if is_chop else '🔴' if is_sell else '🟢'
         order_type = signal.get('order_type')
         order_type_str = " (ALERT ONLY)" if order_type == 'signal_only' else (f" ({order_type.upper()})" if order_type else "")
         sl_target = signal.get('sl_pct')
         sl_str = (f" (+{sl_target*100:.1f}%)" if is_sell else f" (-{sl_target*100:.1f}%)") if sl_target else ""
         fib_target = signal.get('fib_target_pct')
         fib_str = (f" (-{fib_target*100:.0f}%)" if is_sell else f" (+{fib_target*100:.0f}% Fib)") if fib_target else ""
-        notice = "\n\nℹ️ <i>Market is turning BEARISH. Alert only — not applied to Binance account.</i>" if is_sell else ""
+        if is_chop:
+            notice = "\n\nℹ️ <i>Model sees chop / no edge — informational, no order placed.</i>"
+        elif is_sell:
+            notice = "\n\nℹ️ <i>Market is turning BEARISH. Alert only — not applied to Binance account.</i>"
+        else:
+            notice = ""
+        levels_str = "" if is_chop else (
+            f"🎯 Take Profit: <b>{signal.get('take_profit')}</b>{fib_str}\n"
+            f"🛑 Stop Loss:   <b>{signal.get('stop_loss')}</b>{sl_str}\n"
+        )
         msg = (
             f"{emoji} <b>{signal.get('action')} Signal{order_type_str} — {symbol}</b>\n\n"
             f"💰 Price:       <b>{signal.get('entry')}</b>\n"
-            f"🎯 Take Profit: <b>{signal.get('take_profit')}</b>{fib_str}\n"
-            f"🛑 Stop Loss:   <b>{signal.get('stop_loss')}</b>{sl_str}\n"
+            f"{levels_str}"
             f"📊 Confidence:  <b>{signal.get('confidence', 0):.0%}</b>\n"
             f"🔢 Trade:       <b>{daily_trades}/{settings.MAX_TRADES_PER_DAY}</b>"
             f"{notice}"
         )
-        target_chat = chat_id or (self.error_chat_id if is_sell else self.chat_id)
+        target_chat = chat_id or (self.error_chat_id if (is_sell or is_chop) else self.chat_id)
         self.send_message(msg, chat_id=target_chat)
 
     def notify_retrain(self, candles: int, avg_conf: float, max_conf: float, symbol: str = ''):
