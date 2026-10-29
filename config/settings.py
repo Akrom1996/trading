@@ -65,7 +65,6 @@ try:
         SIGNAL_MARGIN: float = Field(default=0.10, description="Required P(bullish) margin above the training base rate")
         LIQ_MIN_EVENTS: int = Field(default=3, description="Min liquidation events in window before a liq bias is trusted")
         LIQ_MIN_NOTIONAL_USD: float = Field(default=20000.0, description="Min liquidation notional in window before a liq bias is trusted")
-        CHOP_ALERT_COOLDOWN_MINUTES: Optional[int] = Field(default=None, description="Cooldown between CHOP alerts (falls back to SELL_ALERT_COOLDOWN_MINUTES)")
 
         # Live guard / state / BTC regime
         REQUIRE_POSITIVE_OOS: bool = Field(default=True, description="Only place real entries when the barrier model's out-of-sample edge is proven")
@@ -75,6 +74,16 @@ try:
         REDIS_RETRY_DELAY_SEC: float = Field(default=3.0, description="Base delay between Redis connection attempts (multiplied by attempt number)")
         BTC_REGIME_MAX_AGE_MIN: int = Field(default=15, description="BTC macro regime older than this is treated as UNKNOWN")
         BTC_REGIME_REQUIRED: bool = Field(default=True, description="Block new entries while the BTC macro regime is UNKNOWN")
+
+        # Walk-forward validation / live guard / network
+        VALIDATION_CANDLES: int = Field(default=12000, description="5m candles fetched for walk-forward validation (~41 days)")
+        WF_TEST_CANDLES: int = Field(default=288, description="Walk-forward test window length in candles")
+        WF_STEP_CANDLES: int = Field(default=288, description="Walk-forward step between windows in candles")
+        WF_RUN_EVERY_HOURS: int = Field(default=24, description="Hours between walk-forward runs")
+        MIN_OOS_EDGE: float = Field(default=0.002, description="Walk-forward avg net must beat the baseline by this (fraction)")
+        MIN_WF_WINDOWS: int = Field(default=20, description="Min walk-forward windows evaluated before the result is trusted")
+        MIN_PROFITABLE_WINDOW_SHARE: float = Field(default=0.55, description="Min share of windows with trades that were net positive")
+        HTTP_TIMEOUT_SEC: float = Field(default=15.0, description="Timeout for every REST call (exchange, liquidation)")
 
         # Database & Cache Persistence
         DB_PATH: str = Field(default="data/bot_data.db", description="Path to SQLite database")
@@ -144,8 +153,6 @@ except ImportError:
             self.SIGNAL_MARGIN = float(os.getenv("SIGNAL_MARGIN", "0.10"))
             self.LIQ_MIN_EVENTS = int(os.getenv("LIQ_MIN_EVENTS", "3"))
             self.LIQ_MIN_NOTIONAL_USD = float(os.getenv("LIQ_MIN_NOTIONAL_USD", "20000"))
-            _chop_cd = os.getenv("CHOP_ALERT_COOLDOWN_MINUTES")
-            self.CHOP_ALERT_COOLDOWN_MINUTES = int(_chop_cd) if _chop_cd else None
 
             self.REQUIRE_POSITIVE_OOS = _parse_bool(os.getenv("REQUIRE_POSITIVE_OOS"), True)
             self.MIN_OOS_TRADES = int(os.getenv("MIN_OOS_TRADES", "30"))
@@ -154,6 +161,15 @@ except ImportError:
             self.REDIS_RETRY_DELAY_SEC = float(os.getenv("REDIS_RETRY_DELAY_SEC", "3"))
             self.BTC_REGIME_MAX_AGE_MIN = int(os.getenv("BTC_REGIME_MAX_AGE_MIN", "15"))
             self.BTC_REGIME_REQUIRED = _parse_bool(os.getenv("BTC_REGIME_REQUIRED"), True)
+
+            self.VALIDATION_CANDLES = int(os.getenv("VALIDATION_CANDLES", "12000"))
+            self.WF_TEST_CANDLES = int(os.getenv("WF_TEST_CANDLES", "288"))
+            self.WF_STEP_CANDLES = int(os.getenv("WF_STEP_CANDLES", "288"))
+            self.WF_RUN_EVERY_HOURS = int(os.getenv("WF_RUN_EVERY_HOURS", "24"))
+            self.MIN_OOS_EDGE = float(os.getenv("MIN_OOS_EDGE", "0.002"))
+            self.MIN_WF_WINDOWS = int(os.getenv("MIN_WF_WINDOWS", "20"))
+            self.MIN_PROFITABLE_WINDOW_SHARE = float(os.getenv("MIN_PROFITABLE_WINDOW_SHARE", "0.55"))
+            self.HTTP_TIMEOUT_SEC = float(os.getenv("HTTP_TIMEOUT_SEC", "15"))
 
             self.DB_PATH = os.getenv("DB_PATH", "data/bot_data.db")
             self.REDIS_URL = os.getenv("REDIS_URL")

@@ -140,6 +140,15 @@ class StateStorage:
                     closed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS validation_results (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    symbol TEXT NOT NULL,
+                    run_at TEXT NOT NULL,
+                    stats TEXT NOT NULL
+                )
+            """)
             self._migrate_trade_date(cursor)
             conn.commit()
 
@@ -273,6 +282,26 @@ class StateStorage:
                 )
 
         return chosen["open_positions"], chosen["daily_trades"], chosen["daily_pnl"], chosen["trade_date"], source
+
+    # ── Walk-forward validation results ─────────────────────────
+
+    def save_validation_result(self, symbol: str, stats: Dict[str, Any]) -> str:
+        run_at = stats.get('run_at') or datetime.now().isoformat()
+        with self.get_db_connection() as conn:
+            conn.execute(
+                "INSERT INTO validation_results (symbol, run_at, stats) VALUES (?, ?, ?)",
+                (symbol, run_at, json.dumps({**stats, 'run_at': run_at})),
+            )
+            conn.commit()
+        return run_at
+
+    def load_latest_validation(self, symbol: str) -> Optional[Dict[str, Any]]:
+        with self.get_db_connection() as conn:
+            row = conn.execute(
+                "SELECT stats FROM validation_results WHERE symbol = ? ORDER BY id DESC LIMIT 1",
+                (symbol,),
+            ).fetchone()
+        return json.loads(row["stats"]) if row else None
 
     # ── Trade History (trade_history) ───────────────────────────
 
@@ -408,6 +437,12 @@ def load_bot_state(symbol: str):
 
 def redis_connected() -> bool:
     return get_storage().redis_connected()
+
+def save_validation_result(symbol: str, stats: Dict[str, Any]) -> str:
+    return get_storage().save_validation_result(symbol, stats)
+
+def load_latest_validation(symbol: str) -> Optional[Dict[str, Any]]:
+    return get_storage().load_latest_validation(symbol)
 
 def record_closed_trade(symbol: str, action: str, entry: float, exit_price: float, pnl_pct: float, reason: str):
     get_storage().record_closed_trade(symbol, action, entry, exit_price, pnl_pct, reason)

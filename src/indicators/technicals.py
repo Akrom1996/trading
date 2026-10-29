@@ -4,6 +4,7 @@ Purely consolidated in src/indicators/technicals.py.
 """
 
 from __future__ import annotations
+import math
 import os
 import pickle
 from datetime import datetime
@@ -283,7 +284,7 @@ def _purged_split(n: int, horizon: int = LABEL_HORIZON_CANDLES) -> Tuple[np.ndar
     return np.arange(train_end), np.arange(test_start, n)
 
 
-def _make_classifier(num_classes: int, **extra) -> Any:
+def _make_classifier(num_classes: int, n_jobs: int = -1, **extra) -> Any:
     is_multiclass = num_classes > 2
     return XGBClassifier(
         n_estimators=300,
@@ -293,7 +294,7 @@ def _make_classifier(num_classes: int, **extra) -> Any:
         num_class=num_classes if is_multiclass else None,
         eval_metric='mlogloss',
         random_state=42,
-        n_jobs=-1,
+        n_jobs=n_jobs,
         **extra,
     )
 
@@ -312,6 +313,119 @@ def _fit_holdout(X: pd.DataFrame, y: pd.Series, train_idx: np.ndarray, test_idx:
     model.fit(scaler.fit_transform(X.iloc[train_idx]), y_enc)
     probs = model.predict_proba(scaler.transform(X.iloc[test_idx]))
     return probs, encoder
+
+
+# ── Trade simulation (shared by the hourly OOS and the walk-forward) ──
+
+def simulate_trades(ohlc: pd.DataFrame, signal_mask: np.ndarray, tier_idx: np.ndarray,
+                    start: int, end: int, horizon: int = LABEL_HORIZON_CANDLES) -> List[Dict[str, Any]]:
+    """
+    Replays entries the way the bot trades them, one position at a time:
+      - signal on closed candle i -> limit at close*(1-ENTRY_OFFSET_PCT), filled if a later candle's low
+        reaches it within PENDING_FILL_TIMEOUT_MINUTES, otherwise cancelled
+      - TP/SL from the fill at the tier's level and live stop min(L, cap); on the fill candle only the SL
+        counts, afterwards a candle touching both counts as SL; no hit within `horizon` -> exit at close
+      - the next signal is only considered after the trade exits (or the unfilled order times out)
+    Signals are taken from [start, end); trades may resolve past `end`. Trades the data can't resolve
+    are marked 'incomplete'. tier_idx holds 1-based tiers per row.
+    """
+    highs = ohlc['high'].to_numpy(dtype=float)
+    lows = ohlc['low'].to_numpy(dtype=float)
+    closes = ohlc['close'].to_numpy(dtype=float)
+    n = len(ohlc)
+    fill_candles = max(1, math.ceil(settings.PENDING_FILL_TIMEOUT_MINUTES / 5))
+    offset = settings.ENTRY_OFFSET_PCT
+    fee = getattr(settings, 'FEE_ROUND_TRIP', 0.0)
+
+    trades: List[Dict[str, Any]] = []
+    i = start
+    while i < min(end, n):
+        if not signal_mask[i]:
+            i += 1
+            continue
+        tier = int(tier_idx[i])
+        level = FIBONACCI_LEVELS[tier - 1]
+        sl = tier_stop_pct(level)
+        limit = closes[i] * (1 - offset)
+
+        fill_j = next((j for j in range(i + 1, min(i + 1 + fill_candles, n)) if lows[j] <= limit), None)
+        if fill_j is None:
+            outcome = 'unfilled' if i + fill_candles < n else 'incomplete'
+            trades.append({'signal_idx': i, 'tier': tier, 'filled': False, 'outcome': outcome})
+            i += fill_candles + 1
+            continue
+
+        tp_price, sl_price = limit * (1 + level), limit * (1 - sl)
+        exit_idx, gross, outcome = None, None, None
+        if lows[fill_j] <= sl_price:
+            exit_idx, gross, outcome = fill_j, -sl, 'sl'
+        else:
+            for k in range(fill_j + 1, min(fill_j + horizon, n - 1) + 1):
+                if lows[k] <= sl_price:
+                    exit_idx, gross, outcome = k, -sl, 'sl'
+                    break
+                if highs[k] >= tp_price:
+                    exit_idx, gross, outcome = k, level, 'tp'
+                    break
+            if exit_idx is None and fill_j + horizon <= n - 1:
+                exit_idx = fill_j + horizon
+                gross, outcome = closes[exit_idx] / limit - 1, 'timeout'
+
+        if exit_idx is None:
+            trades.append({'signal_idx': i, 'tier': tier, 'filled': True, 'outcome': 'incomplete'})
+            break
+        trades.append({
+            'signal_idx': i, 'fill_idx': fill_j, 'exit_idx': exit_idx, 'tier': tier, 'filled': True,
+            'outcome': outcome, 'net': gross - fee,
+        })
+        i = exit_idx + 1
+    return trades
+
+
+def summarize_trades(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Stats over resolved trades: count, fill rate, win rate, avg/total net, max drawdown (all fractions)."""
+    signals = [t for t in trades if t['outcome'] != 'incomplete']
+    done = [t for t in signals if t['filled']]
+    nets = np.array([t['net'] for t in done], dtype=float)
+    if len(nets):
+        equity = np.cumsum(nets)
+        max_dd = float(np.max(np.maximum.accumulate(np.concatenate([[0.0], equity])) - np.concatenate([[0.0], equity])))
+    else:
+        max_dd = 0.0
+    return {
+        'trades': int(len(nets)),
+        'signals': int(len(signals)),
+        'fill_rate': round(len(done) / len(signals), 4) if signals else None,
+        'win_rate': round(float((nets > 0).mean()), 4) if len(nets) else None,
+        'avg_net': round(float(nets.mean()), 5) if len(nets) else None,
+        'total_net': round(float(nets.sum()), 5),
+        'max_drawdown': round(max_dd, 5),
+    }
+
+
+def median_tier(trades: List[Dict[str, Any]], default: int = 2) -> int:
+    tiers = [t['tier'] for t in trades if t.get('filled')]
+    return int(round(float(np.median(tiers)))) if tiers else default
+
+
+def directional_buy_mask(model: Any, scaler: Any, encoder: Any, X: pd.DataFrame,
+                         base_rate_bullish: Optional[float], min_confidence: float = 0.40) -> np.ndarray:
+    """Vectorized generate_signal(): True where the directional model would say BUY."""
+    proba = model.predict_proba(scaler.transform(X))
+    classes = np.asarray(encoder.classes_).astype(int)
+    pred = classes[proba.argmax(axis=1)]
+    confidence = proba.max(axis=1)
+    p_bullish = proba[:, classes >= 1].sum(axis=1)
+    return np.array([_is_buy(int(pr), float(c), float(pb), base_rate_bullish, min_confidence)
+                     for pr, c, pb in zip(pred, confidence, p_bullish)], dtype=bool)
+
+
+def _is_buy(pred: int, confidence: float, p_bullish: float, base_rate_bullish: Optional[float],
+            min_confidence: float) -> bool:
+    # Bullish shortcut only counts if P(bullish) clears the training base rate by SIGNAL_MARGIN
+    bullish_edge = (base_rate_bullish is not None
+                    and p_bullish >= base_rate_bullish + getattr(settings, 'SIGNAL_MARGIN', 0.0))
+    return pred >= 1 and (confidence >= min_confidence or bullish_edge)
 
 
 # ── Directional Model (train, save, load) ───────────────────────
@@ -363,24 +477,27 @@ def _directional_oos(df: pd.DataFrame, X: pd.DataFrame, y: pd.Series) -> Dict[st
     return stats
 
 
-def train_model(df: pd.DataFrame) -> Tuple[Any, Any, Any, Dict[str, Any]]:
+def train_model(df: pd.DataFrame, oos: bool = True, verbose: bool = True,
+                n_jobs: int = -1) -> Tuple[Any, Any, Any, Dict[str, Any]]:
     cap = getattr(settings, 'MAX_RISK_PER_TRADE', DEFAULT_SL_PCT)
-    print(f"  Label distribution (Fibonacci Tiers, stop per tier = min(TP, {cap*100:.1f}%)):")
+    if verbose:
+        print(f"  Label distribution (Fibonacci Tiers, stop per tier = min(TP, {cap*100:.1f}%)):")
     total = len(df)
     class_freqs: Dict[int, float] = {}
     for tier, name in FIB_TIER_NAMES.items():
         count = int((df['label'] == tier).sum())
         pct = (count / total * 100) if total else 0.0
         class_freqs[tier] = round(count / total, 4) if total else 0.0
-        if count > 0:
+        if count > 0 and verbose:
             print(f"    Tier {tier} ({name:22s}): {count:5d} ({pct:.1f}%)")
 
     X = df[FEATURES]
     y = df['label']
     base_rate_bullish = float((y >= 1).mean()) if total else 0.0
-    print(f"  Base rate P(bullish tier) = {base_rate_bullish:.1%}")
+    if verbose:
+        print(f"  Base rate P(bullish tier) = {base_rate_bullish:.1%}")
 
-    oos = _directional_oos(df, X, y)
+    oos_stats = _directional_oos(df, X, y) if oos else None
 
     encoder = LabelEncoder()
     y_encoded = encoder.fit_transform(y)
@@ -389,12 +506,12 @@ def train_model(df: pd.DataFrame) -> Tuple[Any, Any, Any, Dict[str, Any]]:
     X_scaled = scaler.fit_transform(X)
 
     # No class weighting: probabilities must stay on the real-frequency scale of base_rate_bullish
-    model = _make_classifier(len(encoder.classes_), subsample=0.8, colsample_bytree=0.8)
+    model = _make_classifier(len(encoder.classes_), n_jobs=n_jobs, subsample=0.8, colsample_bytree=0.8)
     model.fit(X_scaled, y_encoded)
     train_meta = {
         'class_freqs': class_freqs,
         'base_rate_bullish': round(base_rate_bullish, 4),
-        'oos': oos,
+        'oos': oos_stats,
     }
     return model, scaler, encoder, train_meta
 
@@ -519,57 +636,72 @@ def ev_entry_rule(full_probs: Dict[int, float]) -> Dict[str, Any]:
 
 
 def _barrier_oos(labeled: pd.DataFrame, X: pd.DataFrame, y: pd.Series) -> Dict[str, Any]:
-    """Purged holdout: rows the EV rule would enter, scored on their true per-tier outcome."""
+    """
+    Purged holdout (diagnostic only): EV-rule entries on the test segment replayed as non-overlapping
+    trades with the bot's fill rules, against a baseline that enters on every flat candle at the same tier.
+    """
     train_idx, test_idx = _purged_split(len(labeled))
     fitted = _fit_holdout(X, y, train_idx, test_idx)
     if fitted is None:
         print("  OOS barrier: not enough data for a holdout")
-        return {'test_rows': int(len(test_idx)), 'entered': 0}
+        return {'test_rows': int(len(test_idx)), 'trades': 0}
     probs, encoder = fitted
-    tier_wins = labeled.iloc[test_idx][WIN_COLUMNS].to_numpy(dtype=bool)
-    fee = getattr(settings, 'FEE_ROUND_TRIP', 0.0)
 
-    returns = []
-    for row, row_probs in enumerate(probs):
+    n = len(labeled)
+    mask = np.zeros(n, dtype=bool)
+    tiers = np.ones(n, dtype=int)
+    for row, row_probs in zip(test_idx, probs):
         rule = ev_entry_rule({int(c): float(p) for c, p in zip(encoder.classes_, row_probs)})
-        if not rule['enter']:
-            continue
-        won = tier_wins[row, rule['chosen_tier'] - 1]
-        returns.append((rule['recommended_tp'] if won else -rule['recommended_sl']) - fee)
+        if rule['enter']:
+            mask[row] = True
+            tiers[row] = rule['chosen_tier']
 
-    entered = len(returns)
-    stats = {
+    test_start = int(test_idx[0])
+    model_trades = simulate_trades(labeled, mask, tiers, test_start, n)
+    base_tier = median_tier(model_trades)
+    baseline_trades = simulate_trades(labeled, np.ones(n, dtype=bool), np.full(n, base_tier), test_start, n)
+
+    stats = summarize_trades(model_trades)
+    base = summarize_trades(baseline_trades)
+    edge = (stats['avg_net'] - base['avg_net']
+            if stats['avg_net'] is not None and base['avg_net'] is not None else None)
+    stats.update({
         'test_rows': int(len(test_idx)),
-        'entered': entered,
-        'win_rate': round(float(np.mean([r > 0 for r in returns])), 4) if entered else None,
-        'avg_return': round(float(np.mean(returns)), 5) if entered else None,
-    }
-    if entered:
-        print(f"  OOS barrier: test={stats['test_rows']} entered={entered} "
-              f"win={stats['win_rate']:.0%} avg={stats['avg_return']*100:+.2f}% net")
-    else:
-        print(f"  OOS barrier: test={stats['test_rows']} entered=0 (EV rule never fires)")
+        'baseline_trades': base['trades'],
+        'baseline_avg_net': base['avg_net'],
+        'baseline_tier': base_tier,
+        'edge': round(edge, 5) if edge is not None else None,
+    })
+
+    def pct(v):
+        return f"{v*100:+.2f}%" if v is not None else "n/a"
+    win = f"{stats['win_rate']:.0%}" if stats['win_rate'] is not None else "n/a"
+    print(f"  OOS barrier: trades={stats['trades']} (non-overlapping) win={win} avg={pct(stats['avg_net'])} "
+          f"| baseline avg={pct(base['avg_net'])} | edge={pct(edge)}")
     return stats
 
 
-def train_barrier_model(df: pd.DataFrame, symbol: Optional[str] = None) -> Tuple[Any, Any, Any, Dict[str, Any]]:
+def train_barrier_model(df: pd.DataFrame, symbol: Optional[str] = None, oos: bool = True,
+                        verbose: bool = True, n_jobs: int = -1) -> Tuple[Any, Any, Any, Dict[str, Any]]:
     labeled = label_triple_barrier(df)
     total = len(labeled)
     label_stats = {}
     cap = getattr(settings, 'MAX_RISK_PER_TRADE', DEFAULT_SL_PCT)
-    print(f"  Label distribution{f' ({symbol})' if symbol else ''} (stop per tier = min(TP, {cap*100:.1f}%)):")
+    if verbose:
+        print(f"  Label distribution{f' ({symbol})' if symbol else ''} (stop per tier = min(TP, {cap*100:.1f}%)):")
     for lbl, name in LABEL_NAMES.items():
         count = int((labeled['barrier_label'] == lbl).sum())
         pct = count / total * 100 if total else 0.0
         label_stats[name] = {'count': count, 'pct': round(pct, 1)}
-        flag = " ⚠️ low" if pct / 100 < MIN_HEALTHY_CLASS_SHARE else ""
-        print(f"    {name:20s}: {count:5d} ({pct:.1f}%){flag}")
+        # TIMEOUT needs price to stay within ±1% for the whole horizon, so it's ~always empty; no warning
+        low = pct / 100 < MIN_HEALTHY_CLASS_SHARE and lbl != LABEL_TIMEOUT
+        if verbose:
+            print(f"    {name:20s}: {count:5d} ({pct:.1f}%){' ⚠️ low' if low else ''}")
 
     X = labeled[FEATURES]
     y = labeled['barrier_label']
 
-    oos = _barrier_oos(labeled, X, y)
-    label_stats['oos'] = oos
+    label_stats['oos'] = _barrier_oos(labeled, X, y) if oos else None
 
     encoder = LabelEncoder()
     y_encoded = encoder.fit_transform(y)
@@ -578,7 +710,7 @@ def train_barrier_model(df: pd.DataFrame, symbol: Optional[str] = None) -> Tuple
     X_scaled = scaler.fit_transform(X)
 
     # Unweighted so predicted probabilities reflect real frequencies (the EV rule depends on it)
-    model = _make_classifier(len(encoder.classes_))
+    model = _make_classifier(len(encoder.classes_), n_jobs=n_jobs)
     model.fit(X_scaled, y_encoded)
     return model, scaler, encoder, label_stats
 
@@ -688,10 +820,6 @@ def generate_signal(model: Any, scaler: Any, encoder: Any, df: pd.DataFrame, min
 
     current_price = float(df['close'].iloc[-1])
 
-    # Bullish shortcut only counts if P(bullish) clears the training base rate by SIGNAL_MARGIN
-    bullish_edge = (base_rate_bullish is not None
-                    and p_bullish >= base_rate_bullish + getattr(settings, 'SIGNAL_MARGIN', 0.0))
-
     signal = {
         'action': None,
         'confidence': confidence,
@@ -706,7 +834,7 @@ def generate_signal(model: Any, scaler: Any, encoder: Any, df: pd.DataFrame, min
         'stop_loss': None,
     }
 
-    if pred >= 1 and (confidence >= min_confidence or bullish_edge):
+    if _is_buy(int(pred), confidence, p_bullish, base_rate_bullish, min_confidence):
         target_pct = TIER_TO_PCT.get(int(pred), 0.03)
         max_sl = getattr(settings, 'MAX_RISK_PER_TRADE', SL_PCT)
         sl_pct = round(min(target_pct, max_sl), 4)
