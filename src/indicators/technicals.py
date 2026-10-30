@@ -93,6 +93,9 @@ FLOW_WINDOW = 288  # candles for rolling VWAP / OBV (1 day of 5m); must stay wel
 FEATURE_VERSION = 3  # v2: rolling VWAP / OBV instead of cumulative; v3: per-tier stops in labels
 
 OOS_TEST_FRACTION = 0.2
+
+# One thread per XGBoost fit: on ~2.5k rows extra threads are slower, and several bots share few cores
+MODEL_N_JOBS = 1
 WIN_COLUMNS = [f'win_tier_{k}' for k in range(1, len(FIBONACCI_LEVELS) + 1)]
 
 
@@ -284,7 +287,7 @@ def _purged_split(n: int, horizon: int = LABEL_HORIZON_CANDLES) -> Tuple[np.ndar
     return np.arange(train_end), np.arange(test_start, n)
 
 
-def _make_classifier(num_classes: int, n_jobs: int = -1, **extra) -> Any:
+def _make_classifier(num_classes: int, n_jobs: int = MODEL_N_JOBS, **extra) -> Any:
     is_multiclass = num_classes > 2
     return XGBClassifier(
         n_estimators=300,
@@ -478,7 +481,7 @@ def _directional_oos(df: pd.DataFrame, X: pd.DataFrame, y: pd.Series) -> Dict[st
 
 
 def train_model(df: pd.DataFrame, oos: bool = True, verbose: bool = True,
-                n_jobs: int = -1) -> Tuple[Any, Any, Any, Dict[str, Any]]:
+                n_jobs: int = MODEL_N_JOBS) -> Tuple[Any, Any, Any, Dict[str, Any]]:
     cap = getattr(settings, 'MAX_RISK_PER_TRADE', DEFAULT_SL_PCT)
     if verbose:
         print(f"  Label distribution (Fibonacci Tiers, stop per tier = min(TP, {cap*100:.1f}%)):")
@@ -682,7 +685,7 @@ def _barrier_oos(labeled: pd.DataFrame, X: pd.DataFrame, y: pd.Series) -> Dict[s
 
 
 def train_barrier_model(df: pd.DataFrame, symbol: Optional[str] = None, oos: bool = True,
-                        verbose: bool = True, n_jobs: int = -1) -> Tuple[Any, Any, Any, Dict[str, Any]]:
+                        verbose: bool = True, n_jobs: int = MODEL_N_JOBS) -> Tuple[Any, Any, Any, Dict[str, Any]]:
     labeled = label_triple_barrier(df)
     total = len(labeled)
     label_stats = {}

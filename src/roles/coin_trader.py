@@ -42,6 +42,7 @@ from src.services.redis_cache import (
     save_validation_result,
     load_latest_validation,
 )
+from src.services.job_lock import heavy_job_lock
 from src.services.telegram_notifier import (
     notify_signal,
     notify_signal_with_liq,
@@ -444,11 +445,38 @@ def walk_forward_due(wf: Optional[Dict[str, Any]], now: datetime) -> bool:
 def _walk_forward_job(symbol: str, outcome: Dict[str, Any]):
     """Background thread body: compute and store the result; the main loop does everything else."""
     try:
-        stats = run_walk_forward(symbol, verbose=False)
-        save_validation_result(symbol, stats)
+        with heavy_job_lock() as waited:   # one heavy job at a time across all bots on the host
+            outcome['waited'] = waited
+            started = time.monotonic()
+            stats = run_walk_forward(symbol, verbose=False)
+            save_validation_result(symbol, stats)
+            outcome['took'] = time.monotonic() - started
         outcome['ok'] = True
     except Exception as e:
         outcome['error'] = str(e)
+
+
+def _retrain_job(symbol: str, outcome: Dict[str, Any]):
+    """Background thread body: retrain and save both models; the main loop swaps them in when done."""
+    errors = []
+    try:
+        with heavy_job_lock() as waited:
+            outcome['waited'] = waited
+            started = time.monotonic()
+            df_train = fetch_training_features(symbol)
+            try:
+                outcome['directional'] = retrain_and_save(symbol, df_train)
+            except Exception as e:
+                errors.append(f"Retrain failed: {e}")
+            try:
+                # The OOS logged here is a diagnostic only; it never changes the live guard
+                outcome['barrier'] = retrain_barrier_and_save(symbol, df_train)[:3]
+            except Exception as e:
+                errors.append(f"Barrier retrain failed: {e}")
+            outcome['took'] = time.monotonic() - started
+    except Exception as e:
+        errors.append(f"Training data fetch failed: {e}")
+    outcome['errors'] = errors
 
 
 def drop_unclosed_candle(df: pd.DataFrame, timeframe: str = '5m',
@@ -562,21 +590,27 @@ def run_coin_trader(symbol: Optional[str] = None):
 
     # 1. Load or train directional model
     print(f"[{symbol}] Checking for saved model...")
+    # A stale but valid saved model is used right away and refreshed in the background; only a
+    # missing (or incompatible) model is trained here, under the host-wide training lock.
     model, scaler, encoder, metadata = load_model(symbol=symbol)
-    if model is not None and model_is_fresh(metadata, max_age_hours=settings.MAX_MODEL_AGE_HRS):
+    retrain_now = False
+    if model is not None:
         trained_at = metadata['trained_at'].strftime('%Y-%m-%d %H:%M')
         age_hours = (datetime.now() - metadata['trained_at']).total_seconds() / 3600
         print(f"  Saved model found! Trained at {trained_at} ({age_hours:.1f}h old)")
+        retrain_now = not model_is_fresh(metadata, max_age_hours=settings.MAX_MODEL_AGE_HRS)
     else:
-        print(f"[{symbol}] Training fresh directional model...")
-        model, scaler, encoder, metadata = retrain_and_save(symbol)
+        print(f"[{symbol}] Training fresh directional model (waiting for training lock)...")
+        with heavy_job_lock():
+            model, scaler, encoder, metadata = retrain_and_save(symbol)
 
     # 2. Load or train barrier model
     print(f"[{symbol}] Checking for saved barrier model...")
     barrier_model, barrier_scaler, barrier_encoder, barrier_meta = load_barrier_model(symbol=symbol)
     if barrier_model is None:
-        print(f"[{symbol}] Training fresh barrier model...")
-        barrier_model, barrier_scaler, barrier_encoder, _ = retrain_barrier_and_save(symbol)
+        print(f"[{symbol}] Training fresh barrier model (waiting for training lock)...")
+        with heavy_job_lock():
+            barrier_model, barrier_scaler, barrier_encoder, _ = retrain_barrier_and_save(symbol)
     else:
         print(f"  Saved barrier model found (trained {barrier_meta['trained_at']})")
 
@@ -608,7 +642,10 @@ def run_coin_trader(symbol: Optional[str] = None):
     if open_positions or saved_date == trade_date:
         save_bot_state(symbol, open_positions, daily_trades, daily_pnl, trade_date)
 
-    last_retrain = datetime.now()
+    retrain_every = timedelta(hours=settings.RETRAIN_EVERY_HOURS)
+    next_retrain_at = datetime.now() if retrain_now else datetime.now() + retrain_every
+    retrain_thread: Optional[threading.Thread] = None
+    retrain_outcome: Dict[str, Any] = {}
     limit_notice_sent = False
     loss_limit_notice_sent = False
     last_sell_alert_time: Optional[datetime] = None
@@ -669,7 +706,8 @@ def run_coin_trader(symbol: Optional[str] = None):
                 summary = format_summary(wf_result)
                 was_enabled = live_entries_enabled
                 live_entries_enabled, live_reason = live_entries_allowed(wf_result)
-                print(f"[{symbol}] [{now.strftime('%H:%M')}] Walk-forward finished\n{summary}")
+                print(f"[{symbol}] [{now.strftime('%H:%M')}] Walk-forward finished in {wf_outcome.get('took', 0):.0f}s "
+                      f"(waited {wf_outcome.get('waited', 0):.0f}s for the training lock)\n{summary}")
                 announce_live_state(symbol, live_entries_enabled, live_reason, previous=was_enabled)
                 live_log.should_emit(live_reason, now)   # just announced; don't repeat it below
                 send_message(
@@ -702,30 +740,28 @@ def run_coin_trader(symbol: Optional[str] = None):
             send_message(f"🔄 <b>[{symbol}] Daily counters reset</b>{holding_msg}")
             save_bot_state(symbol, open_positions, daily_trades, daily_pnl, trade_date)
 
-        # Periodic Retrain
-        if (now - last_retrain).total_seconds() / 60 >= 60:
-            print(f"[{symbol}] [{now.strftime('%H:%M')}] Retraining models...")
-            # Advance the timer even on failure so a broken retrain doesn't re-run every loop
-            last_retrain = now
-            try:
-                df_train = fetch_training_features(symbol)
-            except Exception as e:
-                df_train = None
-                notify_error(f"[{symbol}] Training data fetch failed: {e}")
-
-            if df_train is not None:
-                try:
-                    model, scaler, encoder, metadata = retrain_and_save(symbol, df_train)
-                except Exception as e:
-                    notify_error(f"[{symbol}] Retrain failed: {e}")
-
-                try:
-                    # The hourly OOS is a logged diagnostic only; it never changes the live guard
-                    barrier_model, barrier_scaler, barrier_encoder, _ = retrain_barrier_and_save(symbol, df_train)
-                except Exception as e:
-                    notify_error(f"[{symbol}] Barrier retrain failed: {e}")
+        # Periodic retrain: background thread, queued behind other bots' heavy jobs; the loop never waits
+        if retrain_thread is not None and not retrain_thread.is_alive():
+            retrain_thread = None
+            for err in retrain_outcome.get('errors', []):
+                notify_error(f"[{symbol}] {err}")
+            if 'directional' in retrain_outcome:
+                model, scaler, encoder, metadata = retrain_outcome['directional']
+            if 'barrier' in retrain_outcome:
+                barrier_model, barrier_scaler, barrier_encoder = retrain_outcome['barrier']
+            if 'directional' in retrain_outcome or 'barrier' in retrain_outcome:
                 last_signal_candle_ts = None   # re-evaluate the current candle with the new models
-        timer.lap('retrain')
+                print(f"[{symbol}] [{now.strftime('%H:%M')}] Models retrained in {retrain_outcome.get('took', 0):.0f}s "
+                      f"(waited {retrain_outcome.get('waited', 0):.0f}s for the training lock)")
+        if retrain_thread is None and now >= next_retrain_at:
+            # Advance the schedule even if this run fails, so a broken retrain doesn't re-run every loop
+            next_retrain_at = now + retrain_every
+            retrain_outcome = {}
+            retrain_thread = threading.Thread(target=_retrain_job, args=(symbol, retrain_outcome),
+                                              daemon=True, name=f"retrain-{symbol}")
+            retrain_thread.start()
+            print(f"[{symbol}] [{now.strftime('%H:%M')}] Retraining models in background...")
+        timer.lap('retrain_poll')
 
         # Without fresh market data every step below would act on a stale (or undefined) price
         try:
