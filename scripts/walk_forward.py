@@ -32,9 +32,6 @@ from src.indicators.technicals import (
     train_model,
 )
 
-WF_N_JOBS = 2  # leave CPU for the trading loop when this runs in a background thread
-
-
 def _ev_entries(model: Any, scaler: Any, encoder: Any, X: pd.DataFrame):
     probs = model.predict_proba(scaler.transform(X))
     enter = np.zeros(len(X), dtype=bool)
@@ -78,8 +75,8 @@ def run_walk_forward(symbol: str, df: Optional[pd.DataFrame] = None,
         test_start = start + train_len + LABEL_HORIZON_CANDLES   # purge: no train label sees test candles
         test_end = test_start + test_len
 
-        model, scaler, encoder, meta = train_model(add_labels(train), oos=False, verbose=False, n_jobs=WF_N_JOBS)
-        b_model, b_scaler, b_encoder, _ = train_barrier_model(train, oos=False, verbose=False, n_jobs=WF_N_JOBS)
+        model, scaler, encoder, meta = train_model(add_labels(train), oos=False, verbose=False)
+        b_model, b_scaler, b_encoder, _ = train_barrier_model(train, oos=False, verbose=False)
 
         X = feats.iloc[test_start:test_end][FEATURES]
         buy = directional_buy_mask(model, scaler, encoder, X, meta['base_rate_bullish'])
