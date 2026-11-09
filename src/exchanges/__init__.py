@@ -1,6 +1,7 @@
 """Exchanges package."""
 from src.exchanges.binance_client import (
     BinanceClient,
+    InsufficientBalanceError,
     get_binance_client,
     fetch_ohlcv,
     fetch_current_price,
@@ -17,6 +18,7 @@ from src.exchanges.binance_client import (
 
 __all__ = [
     "BinanceClient",
+    "InsufficientBalanceError",
     "get_binance_client",
     "fetch_ohlcv",
     "fetch_current_price",

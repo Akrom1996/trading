@@ -28,6 +28,7 @@ from src.exchanges.binance_client import (
     get_min_notional,
     price_to_precision,
     BinanceClient,
+    InsufficientBalanceError,
 )
 from src.indicators.heatmap import get_liq_data, liq_feed_connected
 from src.services.redis_cache import (
@@ -227,7 +228,8 @@ def open_position(price: float, tp_pct: float, sl_pct: float, now: datetime,
                   label: str, symbol: str, is_pyramid: bool = False,
                   order_type: Optional[str] = None,
                   quote_amount: Optional[float] = None,
-                  allow_virtual: bool = True) -> Optional[dict]:
+                  allow_virtual: bool = True,
+                  virtual_on_insufficient_balance: bool = False) -> Optional[dict]:
     if order_type is None:
         order_type = 'limit' if is_pyramid else 'market'
     amount = quote_amount or settings.QUOTE_AMOUNT_PER_TRADE
@@ -267,6 +269,12 @@ def open_position(price: float, tp_pct: float, sl_pct: float, now: datetime,
             # otherwise stays pending_fill and Step 1 handles it
         return pos
     except Exception as e:
+        if virtual_on_insufficient_balance and isinstance(e, InsufficientBalanceError):
+            # Track the signal as a virtual position so the same BUY isn't re-sent every candle
+            pos.update(status='open', virtual=True, error=str(e))
+            notify_error(f"⚠️ [{symbol}] {label}: {e} — tracking as virtual position")
+            print(f"[{symbol}] [{now.strftime('%H:%M')}] {label}: {e} — opened virtual position")
+            return pos
         if not allow_virtual:
             notify_error(f"⚠️ [{symbol}] {label} order failed ({e}) — skipped")
             print(f"[{symbol}] [{now.strftime('%H:%M')}] {label} order failed ({e}) — not tracking")
@@ -1127,6 +1135,7 @@ def run_coin_trader(symbol: Optional[str] = None):
                 new_pos = open_position(
                     entry_price, effective_tp, effective_sl, now,
                     order_label, symbol, order_type=order_type, allow_virtual=False,
+                    virtual_on_insufficient_balance=True,
                 )
 
                 if new_pos is None:

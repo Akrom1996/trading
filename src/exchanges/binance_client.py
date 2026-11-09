@@ -12,6 +12,10 @@ from config.settings import settings
 _HISTORY_PAGE_ATTEMPTS = 3
 
 
+class InsufficientBalanceError(RuntimeError):
+    """Raised when the account can't fund a buy (pre-check or exchange rejection)."""
+
+
 class BinanceClient:
     """
     Unified Binance API wrapper for market data and order lifecycle.
@@ -220,7 +224,7 @@ class BinanceClient:
             quote_asset = symbol.split('/')[1]
             balance = self.get_available_balance(quote_asset)
             if balance < quote_amount:
-                raise RuntimeError(
+                raise InsufficientBalanceError(
                     f"Insufficient balance: {balance:.2f} {quote_asset} available, "
                     f"{quote_amount:.2f} {quote_asset} required."
                 )
@@ -241,10 +245,13 @@ class BinanceClient:
                 'status': 'closed',
             }
 
-        order = exchange.create_order(
-            symbol=symbol, type='limit', side='buy',
-            amount=formatted_amount, price=formatted_price,
-        )
+        try:
+            order = exchange.create_order(
+                symbol=symbol, type='limit', side='buy',
+                amount=formatted_amount, price=formatted_price,
+            )
+        except ccxt.InsufficientFunds as e:
+            raise InsufficientBalanceError(f"Insufficient balance: {e}") from e
         filled = float(order.get('filled', 0) or 0)
         print(f"[BinanceClient] 📝 LIVE limit buy placed: {formatted_amount} {symbol.split('/')[0]} "
               f"@ {formatted_price} (id: {order.get('id')}, status: {order.get('status')})")
@@ -481,11 +488,22 @@ class BinanceClient:
                 'dry_run': True, 'status': 'closed',
             }
 
+        quote_asset = symbol.split('/')[1]
+        balance = self.get_available_balance(quote_asset)
+        if balance < quote_amount:
+            raise InsufficientBalanceError(
+                f"Insufficient balance: {balance:.2f} {quote_asset} available, "
+                f"{quote_amount:.2f} {quote_asset} required."
+            )
+
         formatted_quote_amount = exchange.cost_to_precision(symbol, quote_amount)
-        order = exchange.create_order(
-            symbol=symbol, type='market', side='buy',
-            amount=None, params={'quoteOrderQty': formatted_quote_amount},
-        )
+        try:
+            order = exchange.create_order(
+                symbol=symbol, type='market', side='buy',
+                amount=None, params={'quoteOrderQty': formatted_quote_amount},
+            )
+        except ccxt.InsufficientFunds as e:
+            raise InsufficientBalanceError(f"Insufficient balance: {e}") from e
         filled = float(order.get('filled', 0) or 0)
         cost = float(order.get('cost', 0) or 0)
         avg_price = (cost / filled) if filled > 0 else float(order.get('price', 0) or 0)
