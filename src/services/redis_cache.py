@@ -149,6 +149,15 @@ class StateStorage:
                     stats TEXT NOT NULL
                 )
             """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS live_entries_state (
+                    symbol TEXT PRIMARY KEY,
+                    enabled INTEGER NOT NULL,
+                    reason TEXT NOT NULL,
+                    wf_run_at TEXT,
+                    updated_at TEXT NOT NULL
+                )
+            """)
             self._migrate_trade_date(cursor)
             conn.commit()
 
@@ -303,6 +312,31 @@ class StateStorage:
             ).fetchone()
         return json.loads(row["stats"]) if row else None
 
+    # ── Live-entries decision (one row per symbol) ──────────────
+
+    def save_live_entries_state(self, symbol: str, enabled: bool, reason: str,
+                                wf_run_at: Optional[str]) -> None:
+        with self.get_db_connection() as conn:
+            conn.execute(
+                """INSERT INTO live_entries_state (symbol, enabled, reason, wf_run_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT(symbol) DO UPDATE SET enabled = excluded.enabled, reason = excluded.reason,
+                       wf_run_at = excluded.wf_run_at, updated_at = excluded.updated_at""",
+                (symbol, int(bool(enabled)), reason, wf_run_at, datetime.now().isoformat()),
+            )
+            conn.commit()
+
+    def load_live_entries_state(self, symbol: str) -> Optional[Dict[str, Any]]:
+        with self.get_db_connection() as conn:
+            row = conn.execute(
+                "SELECT enabled, reason, wf_run_at, updated_at FROM live_entries_state WHERE symbol = ?",
+                (symbol,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {'enabled': bool(row['enabled']), 'reason': row['reason'],
+                'wf_run_at': row['wf_run_at'], 'updated_at': row['updated_at']}
+
     # ── Trade History (trade_history) ───────────────────────────
 
     def record_closed_trade(
@@ -443,6 +477,12 @@ def save_validation_result(symbol: str, stats: Dict[str, Any]) -> str:
 
 def load_latest_validation(symbol: str) -> Optional[Dict[str, Any]]:
     return get_storage().load_latest_validation(symbol)
+
+def save_live_entries_state(symbol: str, enabled: bool, reason: str, wf_run_at: Optional[str]) -> None:
+    get_storage().save_live_entries_state(symbol, enabled, reason, wf_run_at)
+
+def load_live_entries_state(symbol: str) -> Optional[Dict[str, Any]]:
+    return get_storage().load_live_entries_state(symbol)
 
 def record_closed_trade(symbol: str, action: str, entry: float, exit_price: float, pnl_pct: float, reason: str):
     get_storage().record_closed_trade(symbol, action, entry, exit_price, pnl_pct, reason)

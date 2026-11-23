@@ -42,6 +42,8 @@ from src.services.redis_cache import (
     redis_connected,
     save_validation_result,
     load_latest_validation,
+    save_live_entries_state,
+    load_live_entries_state,
 )
 from src.services.job_lock import heavy_job_lock
 from src.services.telegram_notifier import (
@@ -440,14 +442,24 @@ def live_entries_allowed(wf: Optional[Dict[str, Any]]) -> Tuple[bool, str]:
     return proven, f"walk-forward edge {'proven' if proven else 'not proven'} ({detail})"
 
 
-def walk_forward_due(wf: Optional[Dict[str, Any]], now: datetime) -> bool:
-    if not wf or not wf.get('run_at'):
-        return True
-    try:
-        run_at = datetime.fromisoformat(str(wf['run_at']))
-    except ValueError:
-        return True
-    return (now - run_at).total_seconds() >= settings.WF_RUN_EVERY_HOURS * 3600
+def restore_live_entries(symbol: str) -> Tuple[bool, str, bool]:
+    """
+    Live-entry decision at startup: (enabled, reason, walk_forward_needed).
+    A saved decision is reused as-is until the next retrain re-validates; restarts never recompute it.
+    """
+    if not settings.REQUIRE_POSITIVE_OOS:
+        return True, "OOS check disabled", False
+    saved = load_live_entries_state(symbol)
+    if saved is not None:
+        return (saved['enabled'], f"{saved['reason']} [restored from DB, saved {saved['updated_at']}]",
+                False)
+    # No saved decision yet: derive it from the latest stored walk-forward run, if any
+    wf = load_latest_validation(symbol)
+    enabled, reason = live_entries_allowed(wf)
+    if wf is None:
+        return enabled, reason, True
+    save_live_entries_state(symbol, enabled, reason, wf.get('run_at'))
+    return enabled, reason, False
 
 
 def _walk_forward_job(symbol: str, outcome: Dict[str, Any]):
@@ -622,9 +634,9 @@ def run_coin_trader(symbol: Optional[str] = None):
     else:
         print(f"  Saved barrier model found (trained {barrier_meta['trained_at']})")
 
-    # Only the walk-forward result can enable live entries
-    wf_result = load_latest_validation(symbol)
-    live_entries_enabled, live_reason = live_entries_allowed(wf_result)
+    # Only the walk-forward result can enable live entries. The decision is kept in the DB and
+    # reused across restarts; it's re-validated (walk-forward) after each retrain.
+    live_entries_enabled, live_reason, wf_pending = restore_live_entries(symbol)
     announce_live_state(symbol, live_entries_enabled, live_reason, previous=None)
 
     # 3. Restore state (SQLite is the source of truth; a newer Redis copy wins)
@@ -714,6 +726,8 @@ def run_coin_trader(symbol: Optional[str] = None):
                 summary = format_summary(wf_result)
                 was_enabled = live_entries_enabled
                 live_entries_enabled, live_reason = live_entries_allowed(wf_result)
+                save_live_entries_state(symbol, live_entries_enabled, live_reason,
+                                        (wf_result or {}).get('run_at'))
                 print(f"[{symbol}] [{now.strftime('%H:%M')}] Walk-forward finished in {wf_outcome.get('took', 0):.0f}s "
                       f"(waited {wf_outcome.get('waited', 0):.0f}s for the training lock)\n{summary}")
                 announce_live_state(symbol, live_entries_enabled, live_reason, previous=was_enabled)
@@ -724,9 +738,13 @@ def run_coin_trader(symbol: Optional[str] = None):
                     chat_id=settings.TELEGRAM_ERROR_CHAT_ID,
                 )
             else:
+                wf_pending = True   # keep the saved decision; retry later
                 wf_next_attempt = now + timedelta(seconds=WF_RETRY_AFTER_FAIL_SEC)
                 notify_error(f"[{symbol}] Walk-forward failed: {wf_outcome.get('error')}")
-        if wf_thread is None and now >= wf_next_attempt and walk_forward_due(wf_result, now):
+        # Runs after a retrain (never alongside one), or once at startup when no decision exists yet
+        if (wf_pending and wf_thread is None and retrain_thread is None
+                and now >= wf_next_attempt and now < next_retrain_at):
+            wf_pending = False
             wf_outcome = {}
             wf_thread = threading.Thread(target=_walk_forward_job, args=(symbol, wf_outcome),
                                          daemon=True, name=f"walk-forward-{symbol}")
@@ -759,6 +777,8 @@ def run_coin_trader(symbol: Optional[str] = None):
                 barrier_model, barrier_scaler, barrier_encoder = retrain_outcome['barrier']
             if 'directional' in retrain_outcome or 'barrier' in retrain_outcome:
                 last_signal_candle_ts = None   # re-evaluate the current candle with the new models
+                wf_pending = True              # re-validate and update the stored live-entries decision
+                wf_next_attempt = now
                 print(f"[{symbol}] [{now.strftime('%H:%M')}] Models retrained in {retrain_outcome.get('took', 0):.0f}s "
                       f"(waited {retrain_outcome.get('waited', 0):.0f}s for the training lock)")
         if retrain_thread is None and now >= next_retrain_at:
